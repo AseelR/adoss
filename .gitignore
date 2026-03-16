@@ -1,0 +1,6 @@
+/analysis/
+/data/
+/experiments/
+/submit_batch.sbatch
+/submit_batch.sh
+__pycache__/
