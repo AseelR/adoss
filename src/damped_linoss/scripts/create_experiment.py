@@ -16,8 +16,8 @@ import numpy as np
 
 def create_grid_experiment(experiment_folder, model_name, dataset_name):
     # Hyperparameter sweep
-    seed = [0, 1, 2]
-    damping_mode = ["constant"]
+    seed = [3, 4, 5] #[0, 1, 2]
+    damping_mode = ["input"]
 
     lr = [1e-4]
     state_dim = [128]
@@ -49,9 +49,12 @@ def create_grid_experiment(experiment_folder, model_name, dataset_name):
 
             "layer_name": "DampedIMEX1",
             "damping_mode": _damping_mode,   # or "constant" for baseline
-            # "gate_type": "linear",
-            # "mult_min": 0.25,
-            # "mult_max": 4.0,
+            "gate_type": "linear",
+            "freq_aware_damping": True, # set to False for ordinary input dependent damping 
+            "zeta_min": 0.0,
+            "zeta_max": 4.0,
+            "mult_min": 0.25,
+            "mult_max": 4.0,
 
             "num_blocks": _num_blocks,
             "state_dim": _state_dim,
@@ -169,7 +172,7 @@ def create_random_experiment(experiment_folder, model_name, dataset_name):
 if __name__ == "__main__":
     model_name = "LinOSS"
     dataset_name = "Adding2000"
-    experiment_folder = f"D-LinOSS-const-IMEX1-RT-2000/{dataset_name}/"
+    experiment_folder = f"experiments/InputFreq-S345-LinOSS-IMEX1/{dataset_name}/"
 
     if os.path.exists(experiment_folder):
         raise RuntimeError("Experiment already exists!")

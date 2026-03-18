@@ -343,7 +343,7 @@ def train_model(
                 best_state = copy_tree(state, state_filename)
             else:
                 counter += 1
-                if counter >= 10:
+                if counter >= 20:
                     print("--- Early Stopping. ---")
                     break
 

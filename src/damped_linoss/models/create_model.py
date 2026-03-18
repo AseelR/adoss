@@ -114,6 +114,9 @@ def create_model(
             gate_type=hyperparameters.get("gate_type", "linear"),
             mult_min=float(hyperparameters.get("mult_min", 0.25)),
             mult_max=float(hyperparameters.get("mult_max", 4.0)),
+            freq_aware_damping=bool(hyperparameters.get("freq_aware_damping", False)),
+            zeta_min=float(hyperparameters.get("zeta_min", 0.0)),
+            zeta_max=float(hyperparameters.get("zeta_max", 4.0)),
             key=key,
         )
         state = eqx.nn.State(model)
