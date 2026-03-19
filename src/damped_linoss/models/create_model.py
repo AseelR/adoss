@@ -117,6 +117,9 @@ def create_model(
             freq_aware_damping=bool(hyperparameters.get("freq_aware_damping", False)),
             zeta_min=float(hyperparameters.get("zeta_min", 0.0)),
             zeta_max=float(hyperparameters.get("zeta_max", 4.0)),
+            use_block_deer=bool(hyperparameters.get("use_block_deer", False)),
+            deer_num_iters=int(hyperparameters.get("deer_num_iters", 4)),
+            deer_damping=float(hyperparameters.get("deer_damping", 0.0)),
             key=key,
         )
         state = eqx.nn.State(model)

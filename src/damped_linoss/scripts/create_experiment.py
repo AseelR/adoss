@@ -17,7 +17,7 @@ import numpy as np
 def create_grid_experiment(experiment_folder, model_name, dataset_name):
     # Hyperparameter sweep
     seed = [3, 4, 5] #[0, 1, 2]
-    damping_mode = ["input"]
+    damping_mode = ["state_input"]
 
     lr = [1e-4]
     state_dim = [128]
@@ -42,7 +42,7 @@ def create_grid_experiment(experiment_folder, model_name, dataset_name):
             "lr": _learning_rate,
             "ssm_lr_factor": 1.0,  # _ssm_lr_factor,
             "weight_decay": 0.0,  # _weight_decay,
-            "cosine_annealing": False,  # _cosine_annealing,
+            "cosine_annealing": True,  # _cosine_annealing,
             "include_time": _include_time,
             "time_duration": 1.0,
             "tanh_output": False,
@@ -50,11 +50,15 @@ def create_grid_experiment(experiment_folder, model_name, dataset_name):
             "layer_name": "DampedIMEX1",
             "damping_mode": _damping_mode,   # or "constant" for baseline
             "gate_type": "linear",
-            "freq_aware_damping": True, # set to False for ordinary input dependent damping 
+            "freq_aware_damping": False, # set to False for ordinary input dependent damping 
             "zeta_min": 0.0,
             "zeta_max": 4.0,
-            "mult_min": 0.25,
-            "mult_max": 4.0,
+            "mult_min": 0.5,
+            "mult_max": 1.5,
+
+            "use_block_deer": False,
+            "deer_num_iters": 2,
+            "deer_damping": 0.2,
 
             "num_blocks": _num_blocks,
             "state_dim": _state_dim,
@@ -171,8 +175,8 @@ def create_random_experiment(experiment_folder, model_name, dataset_name):
 
 if __name__ == "__main__":
     model_name = "LinOSS"
-    dataset_name = "Adding2000"
-    experiment_folder = f"experiments/InputFreq-S345-LinOSS-IMEX1/{dataset_name}/"
+    dataset_name = "Adding500"
+    experiment_folder = f"experiments/State_InputD_NONdeerv0-S345-LinOSS-IMEX1/{dataset_name}/"
 
     if os.path.exists(experiment_folder):
         raise RuntimeError("Experiment already exists!")
