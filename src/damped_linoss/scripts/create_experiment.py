@@ -47,18 +47,21 @@ def create_grid_experiment(experiment_folder, model_name, dataset_name):
             "time_duration": 1.0,
             "tanh_output": False,
 
+            "gate_variant": "energy",
             "layer_name": "DampedIMEX1",
             "damping_mode": _damping_mode,   # or "constant" for baseline
             "gate_type": "linear",
-            "freq_aware_damping": False, # set to False for ordinary input dependent damping 
             "zeta_min": 0.0,
             "zeta_max": 4.0,
-            "mult_min": 0.5,
-            "mult_max": 1.5,
+            # "mult_min": 0.5,
+            # "mult_max": 1.5,
+            # "freq_aware_damping": False, # set to False for ordinary input dependent damping 
+
 
             "use_block_deer": True,
             "deer_num_iters":2,
             "deer_damping": 0.1,
+            
 
             "num_blocks": _num_blocks,
             "state_dim": _state_dim,
@@ -176,7 +179,7 @@ def create_random_experiment(experiment_folder, model_name, dataset_name):
 if __name__ == "__main__":
     model_name = "LinOSS"
     dataset_name = "Adding500"
-    experiment_folder = f"experiments/State_InputD_deerv0-S345-LinOSS-IMEX1/{dataset_name}/"
+    experiment_folder = f"experiments/SI-energy-S345-LinOSS-IMEX1/{dataset_name}/"
 
     if os.path.exists(experiment_folder):
         raise RuntimeError("Experiment already exists!")

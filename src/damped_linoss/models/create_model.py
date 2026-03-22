@@ -110,6 +110,8 @@ def create_model(
             G_max=safe_load(hyperparameters, "G_max", float),
             dt_std=safe_load(hyperparameters, "dt_std", float),
             drop_rate=safe_load(hyperparameters, "drop_rate", float),
+            gate_variant=hyperparameters.get("gate_variant", "simple"),
+            
             damping_mode=hyperparameters.get("damping_mode", "constant"),
             gate_type=hyperparameters.get("gate_type", "linear"),
             mult_min=float(hyperparameters.get("mult_min", 0.25)),
