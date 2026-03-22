@@ -8,7 +8,7 @@ cosine_annealing: true
 damping_mode: state_input
 data_dir: data
 dataset_name: Adding500
-deer_damping: 0.2
+deer_damping: 0.1
 deer_num_iters: 2
 drop_rate: 0.1
 dt_std: 0.5

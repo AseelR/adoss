@@ -9,8 +9,7 @@ import sympy as sp
 from jaxtyping import PRNGKeyArray
 
 from damped_linoss.models.common import GLU, simple_uniform_init
-from damped_linoss.models.block_deer import block_deer_rollout
-
+from damped_linoss.models.block_deer import block_deer_rollout_from_linearizer
 
 # Parallel scan operations
 @jax.vmap
@@ -569,7 +568,9 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
         x = packed[:, 2] + 1j * packed[:, 3]
         return z, x
 
-
+    def _sigmoid_prime(self, x):
+        s = nn.sigmoid(x)
+        return s * (1.0 - s)
 
     
     def _compute_state_input_multiplier(self, u_k, z_prev, x_prev):
@@ -675,49 +676,114 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
         return jnp.stack([z_next, x_next], axis=1)
 
 
-    def _local_step_state_packed_real(self, local_state, local_driver):
+
+    # local jacobian block builder for state
+    def _local_linearization_state(self, local_state, local_driver):
         """
-        local_driver =
+        local_state: (4,) = [zr, zi, xr, xi]
+        local_driver:
           [a_i, g_base_i, dt_i, bu_re, bu_im,
            w_z_re_i, w_z_im_i, w_x_re_i, w_x_im_i, bias_i]
+        Returns:
+          A_block: (4,4)
+          b_vec:   (4,)
         """
         (
             a_i, g_base_i, dt_i, bu_re, bu_im,
             w_z_re_i, w_z_im_i, w_x_re_i, w_x_im_i, bias_i
         ) = local_driver
 
-        z_prev = local_state[0] + 1j * local_state[1]
-        x_prev = local_state[2] + 1j * local_state[3]
+        zr, zi, xr, xi = local_state
+        z_prev = zr + 1j * zi
+        x_prev = xr + 1j * xi
         bu_i = bu_re + 1j * bu_im
 
         raw = (
-            w_z_re_i * jnp.real(z_prev)
-            + w_z_im_i * jnp.imag(z_prev)
-            + w_x_re_i * jnp.real(x_prev)
-            + w_x_im_i * jnp.imag(x_prev)
+            w_z_re_i * zr
+            + w_z_im_i * zi
+            + w_x_re_i * xr
+            + w_x_im_i * xi
             + bias_i
         )
 
-        mult_i = self.mult_min + (self.mult_max - self.mult_min) * nn.sigmoid(raw)
+        sig = nn.sigmoid(raw)
+        sigp = self._sigmoid_prime(raw)
+
+        mult_i = self.mult_min + (self.mult_max - self.mult_min) * sig
+        dmult_draw = (self.mult_max - self.mult_min) * sigp
+
         g_raw = g_base_i * mult_i
 
-        A_i, G_i = self._project_G(
+        A_i_arr, G_i_arr = self._project_G(
             jnp.array([g_raw]),
             jnp.array([a_i]),
             jnp.array([dt_i]),
         )
-        A_i = A_i[0]
-        G_i = G_i[0]
+        A_i = A_i_arr[0]
+        G_i = G_i_arr[0]
+
+        # Treat projection as fixed in the linearization
+        # i.e. do not differentiate through the projection clamp
+        dg_dzr = g_base_i * dmult_draw * w_z_re_i
+        dg_dzi = g_base_i * dmult_draw * w_z_im_i
+        dg_dxr = g_base_i * dmult_draw * w_x_re_i
+        dg_dxi = g_base_i * dmult_draw * w_x_im_i
 
         S = 1.0 + dt_i * G_i
-        z_next = (z_prev - dt_i * A_i * x_prev + dt_i * bu_i) / S
-        x_next = x_prev + dt_i * z_next
 
-        return jnp.array([jnp.real(z_next), jnp.imag(z_next), jnp.real(x_next), jnp.imag(x_next)])
+        N_re = zr + dt_i * (-A_i * xr + bu_re)
+        N_im = zi + dt_i * (-A_i * xi + bu_im)
 
-    def _local_step_state_input_packed_real(self, local_state, local_driver):
+        d_invS_dzr = -(dt_i / (S ** 2)) * dg_dzr
+        d_invS_dzi = -(dt_i / (S ** 2)) * dg_dzi
+        d_invS_dxr = -(dt_i / (S ** 2)) * dg_dxr
+        d_invS_dxi = -(dt_i / (S ** 2)) * dg_dxi
+
+        # z_next real
+        dzr_dzr = 1.0 / S + N_re * d_invS_dzr
+        dzr_dzi = N_re * d_invS_dzi
+        dzr_dxr = (-dt_i * A_i) / S + N_re * d_invS_dxr
+        dzr_dxi = N_re * d_invS_dxi
+
+        # z_next imag
+        dzi_dzr = N_im * d_invS_dzr
+        dzi_dzi = 1.0 / S + N_im * d_invS_dzi
+        dzi_dxr = N_im * d_invS_dxr
+        dzi_dxi = (-dt_i * A_i) / S + N_im * d_invS_dxi
+
+        # x_next = x_prev + dt * z_next
+        dxr_dzr = dt_i * dzr_dzr
+        dxr_dzi = dt_i * dzr_dzi
+        dxr_dxr = 1.0 + dt_i * dzr_dxr
+        dxr_dxi = dt_i * dzr_dxi
+
+        dxi_dzr = dt_i * dzi_dzr
+        dxi_dzi = dt_i * dzi_dzi
+        dxi_dxr = dt_i * dzi_dxr
+        dxi_dxi = 1.0 + dt_i * dzi_dxi
+
+        A_block = jnp.array([
+            [dzr_dzr, dzr_dzi, dzr_dxr, dzr_dxi],
+            [dzi_dzr, dzi_dzi, dzi_dxr, dzi_dxi],
+            [dxr_dzr, dxr_dzi, dxr_dxr, dxr_dxi],
+            [dxi_dzr, dxi_dzi, dxi_dxr, dxi_dxi],
+        ])
+
+        next_state = jnp.array([
+            N_re / S,
+            N_im / S,
+            xr + dt_i * (N_re / S),
+            xi + dt_i * (N_im / S),
+        ])
+
+        b_vec = next_state - A_block @ local_state
+        return A_block, b_vec
+
+
+
+    def _local_linearization_state_input(self, local_state, local_driver):
         """
-        local_driver =
+        local_driver:
           [a_i, g_base_i, dt_i, bu_re, bu_im, u_term_i,
            w_z_re_i, w_z_im_i, w_x_re_i, w_x_im_i, bias_i]
         """
@@ -726,39 +792,88 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
             w_z_re_i, w_z_im_i, w_x_re_i, w_x_im_i, bias_i
         ) = local_driver
 
-        z_prev = local_state[0] + 1j * local_state[1]
-        x_prev = local_state[2] + 1j * local_state[3]
+        zr, zi, xr, xi = local_state
+        z_prev = zr + 1j * zi
+        x_prev = xr + 1j * xi
         bu_i = bu_re + 1j * bu_im
 
         raw = (
             u_term_i
-            + w_z_re_i * jnp.real(z_prev)
-            + w_z_im_i * jnp.imag(z_prev)
-            + w_x_re_i * jnp.real(x_prev)
-            + w_x_im_i * jnp.imag(x_prev)
+            + w_z_re_i * zr
+            + w_z_im_i * zi
+            + w_x_re_i * xr
+            + w_x_im_i * xi
             + bias_i
         )
 
-        mult_i = self.mult_min + (self.mult_max - self.mult_min) * nn.sigmoid(raw)
+        sig = nn.sigmoid(raw)
+        sigp = self._sigmoid_prime(raw)
+
+        mult_i = self.mult_min + (self.mult_max - self.mult_min) * sig
+        dmult_draw = (self.mult_max - self.mult_min) * sigp
+
         g_raw = g_base_i * mult_i
 
-        A_i, G_i = self._project_G(
+        A_i_arr, G_i_arr = self._project_G(
             jnp.array([g_raw]),
             jnp.array([a_i]),
             jnp.array([dt_i]),
         )
-        A_i = A_i[0]
-        G_i = G_i[0]
+        A_i = A_i_arr[0]
+        G_i = G_i_arr[0]
+
+        dg_dzr = g_base_i * dmult_draw * w_z_re_i
+        dg_dzi = g_base_i * dmult_draw * w_z_im_i
+        dg_dxr = g_base_i * dmult_draw * w_x_re_i
+        dg_dxi = g_base_i * dmult_draw * w_x_im_i
 
         S = 1.0 + dt_i * G_i
-        z_next = (z_prev - dt_i * A_i * x_prev + dt_i * bu_i) / S
-        x_next = x_prev + dt_i * z_next
 
-        return jnp.array([jnp.real(z_next), jnp.imag(z_next), jnp.real(x_next), jnp.imag(x_next)])
+        N_re = zr + dt_i * (-A_i * xr + bu_re)
+        N_im = zi + dt_i * (-A_i * xi + bu_im)
 
+        d_invS_dzr = -(dt_i / (S ** 2)) * dg_dzr
+        d_invS_dzi = -(dt_i / (S ** 2)) * dg_dzi
+        d_invS_dxr = -(dt_i / (S ** 2)) * dg_dxr
+        d_invS_dxi = -(dt_i / (S ** 2)) * dg_dxi
 
-    
+        dzr_dzr = 1.0 / S + N_re * d_invS_dzr
+        dzr_dzi = N_re * d_invS_dzi
+        dzr_dxr = (-dt_i * A_i) / S + N_re * d_invS_dxr
+        dzr_dxi = N_re * d_invS_dxi
 
+        dzi_dzr = N_im * d_invS_dzr
+        dzi_dzi = 1.0 / S + N_im * d_invS_dzi
+        dzi_dxr = N_im * d_invS_dxr
+        dzi_dxi = (-dt_i * A_i) / S + N_im * d_invS_dxi
+
+        dxr_dzr = dt_i * dzr_dzr
+        dxr_dzi = dt_i * dzr_dzi
+        dxr_dxr = 1.0 + dt_i * dzr_dxr
+        dxr_dxi = dt_i * dzr_dxi
+
+        dxi_dzr = dt_i * dzi_dzr
+        dxi_dzi = dt_i * dzi_dzi
+        dxi_dxr = dt_i * dzi_dxr
+        dxi_dxi = 1.0 + dt_i * dzi_dxi
+
+        A_block = jnp.array([
+            [dzr_dzr, dzr_dzi, dzr_dxr, dzr_dxi],
+            [dzi_dzr, dzi_dzi, dzi_dxr, dzi_dxi],
+            [dxr_dzr, dxr_dzi, dxr_dxr, dxr_dxi],
+            [dxi_dzr, dxi_dzi, dxi_dxr, dxi_dxi],
+        ])
+
+        next_state = jnp.array([
+            N_re / S,
+            N_im / S,
+            xr + dt_i * (N_re / S),
+            xi + dt_i * (N_im / S),
+        ])
+
+        b_vec = next_state - A_block @ local_state
+        return A_block, b_vec
+   
 
 
     def _recurrence(self, A_diag, G_seq, dt, Bu_elements):
@@ -858,28 +973,22 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
         return ys
 
 
-    def _run_block_deer(self, local_step_fn, input_sequence, A_diag, G_base, dt, B_complex, state_input=False):
+    def _run_block_deer(self, input_sequence, A_diag, G_base, dt, B_complex, state_input=False):
         P = self.state_dim
         T = input_sequence.shape[0]
 
-        # Initial packed state: (P,4)
         initial_packed = jnp.zeros((P, 4), dtype=jnp.float32)
         states_guess = jnp.zeros((T, P, 4), dtype=jnp.float32)
 
-        # forcing term B u_k
         Bu_elements = jax.vmap(lambda u: B_complex @ u)(input_sequence)   # (T,P)
-
-        a = A_diag
-        g = G_base
-        d = dt
 
         if state_input:
             u_terms = jax.vmap(self.state_input_u_linear)(input_sequence)  # (T,P)
 
             local_drivers = jnp.stack([
-                jnp.broadcast_to(a[None, :], (T, P)),
-                jnp.broadcast_to(g[None, :], (T, P)),
-                jnp.broadcast_to(d[None, :], (T, P)),
+                jnp.broadcast_to(A_diag[None, :], (T, P)),
+                jnp.broadcast_to(G_base[None, :], (T, P)),
+                jnp.broadcast_to(dt[None, :], (T, P)),
                 jnp.real(Bu_elements),
                 jnp.imag(Bu_elements),
                 u_terms,
@@ -888,13 +997,14 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
                 jnp.broadcast_to(self.state_input_w_x_re[None, :], (T, P)),
                 jnp.broadcast_to(self.state_input_w_x_im[None, :], (T, P)),
                 jnp.broadcast_to(self.state_input_bias[None, :], (T, P)),
-            ], axis=-1)   # (T,P,11)
+            ], axis=-1)
 
+            local_linearizer = self._local_linearization_state_input
         else:
             local_drivers = jnp.stack([
-                jnp.broadcast_to(a[None, :], (T, P)),
-                jnp.broadcast_to(g[None, :], (T, P)),
-                jnp.broadcast_to(d[None, :], (T, P)),
+                jnp.broadcast_to(A_diag[None, :], (T, P)),
+                jnp.broadcast_to(G_base[None, :], (T, P)),
+                jnp.broadcast_to(dt[None, :], (T, P)),
                 jnp.real(Bu_elements),
                 jnp.imag(Bu_elements),
                 jnp.broadcast_to(self.state_w_z_re[None, :], (T, P)),
@@ -902,20 +1012,34 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
                 jnp.broadcast_to(self.state_w_x_re[None, :], (T, P)),
                 jnp.broadcast_to(self.state_w_x_im[None, :], (T, P)),
                 jnp.broadcast_to(self.state_bias[None, :], (T, P)),
-            ], axis=-1)   # (T,P,10)
+            ], axis=-1)
 
-        final_states, _ = block_deer_rollout(
-            local_step_fn=local_step_fn,
-            initial_state=initial_packed,
-            local_drivers=local_drivers,
+            local_linearizer = self._local_linearization_state
+
+        def build_linearization(states):
+            # states: (T,P,4)
+            if T == 1:
+                A0, b0 = jax.vmap(local_linearizer)(initial_packed, local_drivers[0])
+                return A0[None, ...], b0[None, ...]
+
+            A_rest, b_rest = jax.vmap(
+                lambda states_t, drivers_t: jax.vmap(local_linearizer)(states_t, drivers_t)
+            )(states[:-1], local_drivers[1:])
+
+            A0, b0 = jax.vmap(local_linearizer)(initial_packed, local_drivers[0])
+
+            A = jnp.concatenate([A0[None, ...], A_rest], axis=0)
+            b = jnp.concatenate([b0[None, ...], b_rest], axis=0)
+            return A, b
+
+        final_states, _ = block_deer_rollout_from_linearizer(
+            build_linearization=build_linearization,
             states_guess=states_guess,
             num_iters=self.deer_num_iters,
-            damping=self.deer_damping,
         )
 
         _, x_states = jax.vmap(self._unpack_state_real)(final_states)
         return x_states
-
 
     def __call__(self, input_sequence):
         # Materialize parameters
@@ -936,10 +1060,11 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
         if self.damping_mode in ["constant", "input"]:
             A_diag_eff, G_seq = self._compute_G_seq(input_sequence, G_base, A_diag, dt)
             ys = self._recurrence(A_diag_eff, G_seq, dt, Bu_elements)
+        
+    
         elif self.damping_mode == "state":
             if self.use_block_deer:
                 ys = self._run_block_deer(
-                    self._local_step_state_packed_real,
                     input_sequence,
                     A_diag,
                     G_base,
@@ -953,7 +1078,6 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
         elif self.damping_mode == "state_input":
             if self.use_block_deer:
                 ys = self._run_block_deer(
-                    self._local_step_state_input_packed_real,
                     input_sequence,
                     A_diag,
                     G_base,
@@ -963,7 +1087,7 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
                 )
             else:
                 ys = self._recurrence_state_input(A_diag, G_base, dt, Bu_elements, input_sequence)
-
+                
         else:
             raise NotImplementedError(
                 f"damping_mode={self.damping_mode} not implemented in DampedIMEX1Layer."
