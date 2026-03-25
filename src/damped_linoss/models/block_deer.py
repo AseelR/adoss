@@ -28,7 +28,6 @@ def block_deer_rollout_from_linearizer(
     build_linearization,
     states_guess,
     num_iters=4,
-    mix=0.0,
 ):
     """
     Repeated DEER updates using user-supplied affine linearizations.
@@ -36,17 +35,14 @@ def block_deer_rollout_from_linearizer(
     build_linearization(states_guess) should return:
       A: (T, P, B, B)
       b: (T, P, B)
-
-    mix in [0,1]:
-      0.0 -> full DEER update
-      0.1 -> 10% old iterate, 90% new iterate
-      1.0 -> no update
     """
     def body_fn(states, _):
         A, b = build_linearization(states)
         new_states = linearized_rollout_from_blocks(A, b)
-        updated_states = mix * states + (1.0 - mix) * new_states
-        return updated_states, updated_states
+        return new_states, new_states
 
     final_states, states_trace = jax.lax.scan(body_fn, states_guess, None, length=num_iters)
     return final_states, states_trace
+
+
+    

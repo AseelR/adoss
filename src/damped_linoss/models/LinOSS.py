@@ -194,25 +194,18 @@ class IMEXLayer(_AbstractLinOSSLayer):
 
         return xs
     
-
+    
 
 class DampedIMEX1Layer(_AbstractLinOSSLayer):
     """
-    IMEX damped oscillatory layer with bounded per-mode damping ratio gating.
+    Based on the characteristic recurrence
+    z_k+1 = z_k + dt * (-Ax_k - Gz_k+1 + Bu_k+1)
+    x_k+1 = x_k + dt * (z_k+1)
 
-    Main supported variants:
-      - damping_mode = "constant"
-      - damping_mode = "input",       gate_variant = "simple"
-      - damping_mode = "input",       gate_variant = "energy"
-      - damping_mode = "state_input", gate_variant = "simple"
-      - damping_mode = "state_input", gate_variant = "energy"
-
-    Here
-        G_{i,k} = 2 * omega_i * zeta_{i,k},
-        omega_i = sqrt(A_i),
-        zeta_{i,k} in [zeta_min, zeta_max].
+    Supports:
+      - damping_mode = "constant"  -> original D-LinOSS behavior
+      - damping_mode = "input"     -> input-dependent damping G_k = G_base * m_k
     """
-
     A_diag: jax.Array
     G_diag: jax.Array
     B: jax.Array
@@ -222,7 +215,10 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
     state_dim: int
 
     damping_mode: str
-    gate_variant: str
+    gate_type: str
+    mult_min: float
+    mult_max: float
+    freq_aware_damping: bool
     zeta_min: float
     zeta_max: float
 
@@ -230,19 +226,29 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
     deer_num_iters: int
     deer_damping: float
 
-    # input gate
-    u_to_zeta: eqx.nn.Linear | None
-    input_rho: jax.Array | None
-    input_bias: jax.Array | None
+    gate_linear: eqx.nn.Linear | None
+    gate_hidden_dim: int
+    gate_nonlinearity: str
+    gate_use_energy: bool
 
-    # state-input gate
-    si_u_to_zeta: eqx.nn.Linear | None
-    si_w_z_re: jax.Array | None
-    si_w_z_im: jax.Array | None
-    si_w_x_re: jax.Array | None
-    si_w_x_im: jax.Array | None
-    si_bias: jax.Array | None
-    si_rho: jax.Array | None
+    gate_in: eqx.nn.Linear | None
+    gate_out: eqx.nn.Linear | None
+    gate_energy_scale: jax.Array | None
+
+    # local per-mode state gate params
+    state_w_z_re: jax.Array | None
+    state_w_z_im: jax.Array | None
+    state_w_x_re: jax.Array | None
+    state_w_x_im: jax.Array | None
+    state_bias: jax.Array | None
+
+    # state-input gate: full input dependence + local state dependence
+    state_input_u_linear: eqx.nn.Linear | None
+    state_input_w_z_re: jax.Array | None
+    state_input_w_z_im: jax.Array | None
+    state_input_w_x_re: jax.Array | None
+    state_input_w_x_im: jax.Array | None
+    state_input_bias: jax.Array | None
 
     def __init__(
         self,
@@ -259,24 +265,35 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
         A_max: float,
         dt_std: float,
         damping_mode: str = "constant",
-        gate_variant: str = "simple",
-        gate_type: str = "linear",          # kept for backward compatibility
-        mult_min: float = 0.25,             # unused, kept for backward compatibility
-        mult_max: float = 4.0,              # unused, kept for backward compatibility
-        freq_aware_damping: bool = False,   # unused, kept for backward compatibility
+        gate_type: str = "linear",
+        mult_min: float = 0.25,
+        mult_max: float = 4.0,
+        gate_hidden_dim: int = 64,
+        gate_nonlinearity: str = "gelu",
+        gate_use_energy: bool = False,
+        freq_aware_damping: bool = False,
         zeta_min: float = 0.0,
         zeta_max: float = 4.0,
+
         use_block_deer: bool = False,
         deer_num_iters: int = 4,
         deer_damping: float = 0.0,
+
         key: PRNGKeyArray = None,
         **kwargs,
     ):
         self.state_dim = state_dim
         self.damping_mode = damping_mode
-        self.gate_variant = gate_variant
+        self.gate_type = gate_type
+        self.mult_min = mult_min
+        self.mult_max = mult_max
+        self.freq_aware_damping = freq_aware_damping
         self.zeta_min = zeta_min
         self.zeta_max = zeta_max
+
+        self.gate_hidden_dim = gate_hidden_dim
+        self.gate_nonlinearity = gate_nonlinearity
+        self.gate_use_energy = gate_use_energy
 
         self.use_block_deer = use_block_deer
         self.deer_num_iters = deer_num_iters
@@ -295,87 +312,108 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
         else:
             raise ValueError(f"Unknown initialization: {initialization}")
 
-        self.B = simple_uniform_init(
-            B_key,
-            shape=(state_dim, hidden_dim, 2),
-            std=1.0 / jnp.sqrt(hidden_dim),
-        )
-        self.C = simple_uniform_init(
-            C_key,
-            shape=(hidden_dim, state_dim, 2),
-            std=1.0 / jnp.sqrt(state_dim),
-        )
+        self.B = simple_uniform_init(B_key, shape=(state_dim, hidden_dim, 2), std=1.0 / jnp.sqrt(hidden_dim))
+        self.C = simple_uniform_init(C_key, shape=(hidden_dim, state_dim, 2), std=1.0 / jnp.sqrt(state_dim))
         self.D = normal(stddev=1.0)(D_key, (hidden_dim,))
 
-        # defaults
-        self.u_to_zeta = None
-        self.input_rho = None
-        self.input_bias = None
+        # default settings
+        self.gate_linear = None
 
-        self.si_u_to_zeta = None
-        self.si_w_z_re = None
-        self.si_w_z_im = None
-        self.si_w_x_re = None
-        self.si_w_x_im = None
-        self.si_bias = None
-        self.si_rho = None
+        self.state_w_z_re = None
+        self.state_w_z_im = None
+        self.state_w_x_re = None
+        self.state_w_x_im = None
+        self.state_bias = None
 
-        if gate_type != "linear":
-            raise NotImplementedError(
-                "This refactor currently supports only linear pre-activations."
-            )
+        self.state_input_u_linear = None
+        self.state_input_w_z_re = None
+        self.state_input_w_z_im = None
+        self.state_input_w_x_re = None
+        self.state_input_w_x_im = None
+        self.state_input_bias = None
 
+
+        self.gate_linear = None
+        self.gate_in = None
+        self.gate_out = None
+        self.gate_energy_scale = None
+        
         if damping_mode == "input":
-            k_u, k_rho = jr.split(gate_key, 2)
-            self.u_to_zeta = eqx.nn.Linear(hidden_dim, state_dim, key=k_u)
-            self.input_bias = jnp.zeros((state_dim,))
-            if gate_variant == "energy":
-                # scan-compatible energy from current forcing magnitude |Bu_k|^2
-                self.input_rho = jnp.zeros((state_dim,))
-            elif gate_variant != "simple":
-                raise ValueError(f"Unknown gate_variant={gate_variant}")
+            if gate_type == "linear":
+                self.gate_linear = eqx.nn.Linear(hidden_dim, state_dim, key=gate_key)
+                self.gate_in = None
+                self.gate_out = None
+            elif gate_type == "mlp":
+                gate_key1, gate_key2 = jr.split(gate_key, 2)
+                self.gate_linear = None
+                self.gate_in = eqx.nn.Linear(hidden_dim, gate_hidden_dim, key=gate_key1)
+                self.gate_out = eqx.nn.Linear(gate_hidden_dim, state_dim, key=gate_key2)
+            else:
+                raise NotImplementedError(f"gate_type={gate_type} not implemented.")
+
+            if gate_use_energy:
+                self.gate_energy_scale = jnp.zeros((state_dim,))
+            else:
+                self.gate_energy_scale = None
+
+        elif damping_mode == "state":
+
+
+            if gate_type == "linear":
+                k1, k2, k3, k4, k5 = jr.split(gate_key, 5)
+                scale = 1.0 / jnp.sqrt(4.0)
+                self.state_w_z_re = normal(stddev=scale)(k1, (state_dim,))
+                self.state_w_z_im = normal(stddev=scale)(k2, (state_dim,))
+                self.state_w_x_re = normal(stddev=scale)(k3, (state_dim,))
+                self.state_w_x_im = normal(stddev=scale)(k4, (state_dim,))
+                self.state_bias   = jnp.zeros((state_dim,))
+            else:
+                raise NotImplementedError(f"gate_type={gate_type} not implemented.")
 
         elif damping_mode == "state_input":
-            ku, k1, k2, k3, k4, k5 = jr.split(gate_key, 6)
-            scale = 1.0 / jnp.sqrt(4.0)
-            self.si_u_to_zeta = eqx.nn.Linear(hidden_dim, state_dim, key=ku)
-            self.si_w_z_re = normal(stddev=scale)(k1, (state_dim,))
-            self.si_w_z_im = normal(stddev=scale)(k2, (state_dim,))
-            self.si_w_x_re = normal(stddev=scale)(k3, (state_dim,))
-            self.si_w_x_im = normal(stddev=scale)(k4, (state_dim,))
-            self.si_bias = jnp.zeros((state_dim,))
-            if gate_variant == "energy":
-                self.si_rho = jnp.zeros((state_dim,))
-            elif gate_variant != "simple":
-                raise ValueError(f"Unknown gate_variant={gate_variant}")
+            if gate_type == "linear":
+                ku, k1, k2, k3, k4, k5 = jr.split(gate_key, 6)
+                scale = 1.0 / jnp.sqrt(4.0)
+                self.state_input_u_linear = eqx.nn.Linear(hidden_dim, state_dim, key=ku)
+                self.state_input_w_z_re = normal(stddev=scale)(k1, (state_dim,))
+                self.state_input_w_z_im = normal(stddev=scale)(k2, (state_dim,))
+                self.state_input_w_x_re = normal(stddev=scale)(k3, (state_dim,))
+                self.state_input_w_x_im = normal(stddev=scale)(k4, (state_dim,))
+                self.state_input_bias   = jnp.zeros((state_dim,))
+            else:
+                raise NotImplementedError(f"gate_type={gate_type} not implemented.")
 
-        elif damping_mode != "constant":
-            raise ValueError(f"Unknown damping_mode={damping_mode}")
+        
 
-    # ------------------------------------------------------------------
-    # initialization / projection
-    # ------------------------------------------------------------------
+
+
 
     def _is_valid_AGdt(self, A_diag, G_diag, dt):
+        """Boolean check if (A,G,dt) in valid region"""
         dt = nn.sigmoid(dt)
         return (G_diag >= 0) & (((G_diag - dt * A_diag) ** 2 - 4 * A_diag) < 0)
 
     def _ring_init_AGdt(self, r_min, r_max, theta_min, theta_max, dt_std, key):
-        a, g, dt, lam1, lam2 = sp.symbols("a g dt lam1 lam2")
+        # Solve symbolically
+        a, g, dt, lam1, lam2 = sp.symbols('a g dt lam1 lam2')
 
+        # Characteristic recurrence for 1 decoupled 2x2 system
         M_i = sp.Matrix([
             [1 / (1 + dt * g), -a * dt / (1 + dt * g)],
-            [dt / (1 + dt * g), 1 - a * dt**2 / (1 + dt * g)],
+            [dt / (1 + dt * g), 1 - a * dt**2 / (1 + dt * g)]
         ])
+        # Eigenvalue pair expressions
         eigs = list(M_i.eigenvals().keys())
         eqs = [sp.Eq(eigs[0], lam1), sp.Eq(eigs[1], lam2)]
         sol = sp.solve(eqs, (a, g))[0]
         f = sp.lambdify((lam1, lam2, dt), sol, "numpy")
-
+        
+        # Sample timesteps
         mag_key, arg_key, dt_key = jr.split(key, 3)
         dt_vals = normal(stddev=dt_std)(dt_key, (self.state_dim,))
         dt_sigmoid = nn.sigmoid(dt_vals)
 
+        # Sample eigenvalues in ring 
         mag = jnp.sqrt(
             jr.uniform(mag_key, shape=(self.state_dim,)) * (r_max**2 - r_min**2) + r_min**2
         )
@@ -383,8 +421,10 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
         lam1_vals = mag * jnp.cos(arg) + 1j * mag * jnp.sin(arg)
         lam2_vals = mag * jnp.cos(arg) - 1j * mag * jnp.sin(arg)
 
+        # Convert to (A, G) representation
         a_vals, g_vals = f(lam1_vals, lam2_vals, dt_sigmoid)
 
+        # Invertibility, stability, and validity checks
         h1 = sp.lambdify((a, g, dt), eigs[0], "numpy")
         h2 = sp.lambdify((a, g, dt), eigs[1], "numpy")
         lam1_out_vals = h1(a_vals, g_vals, dt_sigmoid)
@@ -404,12 +444,18 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
         print(f"Stability check: {stable}")
         print(f"Validity check: {valid}")
 
-        return a_vals.real, g_vals.real, dt_vals
+        a_vals = a_vals.real
+        g_vals = g_vals.real
+
+        return a_vals, g_vals, dt_vals
 
     def _uniform_init_AGdt(self, A_min, A_max, G_min, G_max, dt_std, key):
+        """Uniform sampling over valid (A,G,dt) region"""
         bsz = 512
         done = False
-        A_vals, G_vals, dt_vals = [], [], []
+        A_vals = []
+        G_vals = []
+        dt_vals = []
 
         while not done:
             A_key, G_key, dt_key, key = jr.split(key, 4)
@@ -422,180 +468,382 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
             G_vals.extend(list(G_diag[mask]))
             dt_vals.extend(list(dt[mask]))
 
-            if len(A_vals) >= self.state_dim:
+            if (
+                len(A_vals) >= self.state_dim and
+                len(G_vals) >= self.state_dim and
+                len(dt_vals) >= self.state_dim
+            ):
                 done = True
 
-        return (
-            jnp.array(A_vals[:self.state_dim]),
-            jnp.array(G_vals[:self.state_dim]),
-            jnp.array(dt_vals[:self.state_dim]),
-        )
+        A_diag = jnp.array(A_vals[:self.state_dim])
+        G_diag = jnp.array(G_vals[:self.state_dim])
+        dt = jnp.array(dt_vals[:self.state_dim])
+
+        return A_diag, G_diag, dt
 
     def _project_A_dt(self, A_diag, dt):
+        """Project only A and dt."""
         dt = nn.sigmoid(dt)
         A_diag = jnp.maximum(A_diag, 0.0)
         return A_diag, dt
 
     def _project_G(self, G_diag, A_diag, dt):
+        """
+        Project G given already-projected A and dt.
+        Note: allows static or time-varying G with same formula.
+        """
         G_diag = jnp.maximum(G_diag, 0.0)
 
         A_low = (2 + dt * G_diag - 2 * jnp.sqrt(1 + dt * G_diag)) / jnp.maximum(dt**2, 1e-6)
         A_high = (2 + dt * G_diag + 2 * jnp.sqrt(1 + dt * G_diag)) / jnp.maximum(dt**2, 1e-6)
 
+        # Clamp A into valid interval induced by G
         A_proj = A_low + nn.relu(A_diag - A_low) - nn.relu(A_diag - A_high)
         return A_proj, G_diag
 
-    # ------------------------------------------------------------------
-    # gate helpers
-    # ------------------------------------------------------------------
 
-    def _omega_from_A(self, A_diag):
-        return jnp.sqrt(jnp.maximum(A_diag, 1e-8))
+    # def _project_G(self, G_diag, A_diag, dt):
+    #     """
+    #     Project G given fixed projected A and dt.
+    #     Keeps A fixed and bounds G into the admissible interval.
+    #     """
+    #     G_diag = jnp.maximum(G_diag, 0.0)
 
-    def _bounded_zeta(self, raw):
-        return self.zeta_min + (self.zeta_max - self.zeta_min) * nn.sigmoid(raw)
+    #     sqrtA = jnp.sqrt(jnp.maximum(A_diag, 1e-8))
+    #     G_low = jnp.maximum(0.0, dt * A_diag - 2.0 * sqrtA)
+    #     G_high = dt * A_diag + 2.0 * sqrtA
 
-    def _sigmoid_prime(self, x):
-        s = nn.sigmoid(x)
-        return s * (1.0 - s)
+    #     G_proj = G_low + nn.relu(G_diag - G_low) - nn.relu(G_diag - G_high)
+    #     return G_proj
+
+
+    def _compute_multiplier(self, input_sequence, Bu_elements=None):
+        raw = self._compute_gate_raw(input_sequence, Bu_elements)
+        sig = nn.sigmoid(raw)
+        mult = self.mult_min + (self.mult_max - self.mult_min) * sig
+        return mult
+
+
+
+    def _compute_zeta_seq(self, input_sequence, Bu_elements=None):
+        raw = self._compute_gate_raw(input_sequence, Bu_elements)
+        sig = nn.sigmoid(raw)
+        zeta = self.zeta_min + (self.zeta_max - self.zeta_min) * sig
+        return zeta
+
+    def _gate_act(self, x):
+        if self.gate_nonlinearity == "gelu":
+            return jax.nn.gelu(x)
+        elif self.gate_nonlinearity == "tanh":
+            return jnp.tanh(x)
+        elif self.gate_nonlinearity == "relu":
+            return jax.nn.relu(x)
+        else:
+            raise ValueError(f"Unknown gate_nonlinearity={self.gate_nonlinearity}")
+    
+    def _compute_gate_raw(self, input_sequence, Bu_elements=None):
+        if self.gate_type == "linear":
+            raw = jax.vmap(self.gate_linear)(input_sequence)   # (L, P)
+        elif self.gate_type == "mlp":
+            h = jax.vmap(self.gate_in)(input_sequence)         # (L, H)
+            h = self._gate_act(h)
+            raw = jax.vmap(self.gate_out)(h)                   # (L, P)
+        else:
+            raise NotImplementedError(f"gate_type={self.gate_type} not implemented.")
+
+        if self.gate_use_energy and Bu_elements is not None:
+            # simple input-energy term; still scan-compatible
+            energy = jnp.abs(Bu_elements) ** 2                 # (L, P)
+            raw = raw + energy * self.gate_energy_scale[None, :]
+
+        return raw
+
 
     def _state_features(self, z_prev, x_prev):
-        return (
-            jnp.real(z_prev),
-            jnp.imag(z_prev),
-            jnp.real(x_prev),
-            jnp.imag(x_prev),
-        )
+        """
+        Per-mode real-valued state features.
+        Returns 4 vectors of shape (P,):
+          z_re, z_im, x_re, x_im
+        """
+        return (jnp.real(z_prev), jnp.imag(z_prev), jnp.real(x_prev), jnp.imag(x_prev))
+    
 
-    def _local_energy(self, z_prev, x_prev, A_diag):
-        return A_diag * (jnp.abs(x_prev) ** 2) + (jnp.abs(z_prev) ** 2)
 
-    def _input_energy(self, Bu_elements):
-        # scan-compatible per-mode current forcing energy
-        return jnp.abs(Bu_elements) ** 2
+    def _compute_state_multiplier(self, z_prev, x_prev):
+        """
+        State-dependent multiplier m_k in [mult_min, mult_max], with local per-mode state dependence.
+        """
+        if self.gate_type != "linear":
+            raise NotImplementedError(f"gate_type={self.gate_type} not implemented yet.")
 
-    def _compute_zeta_input_seq(self, input_sequence, Bu_elements):
-        raw = jax.vmap(self.u_to_zeta)(input_sequence) + self.input_bias[None, :]
-        if self.gate_variant == "energy":
-            raw = raw + self.input_rho[None, :] * self._input_energy(Bu_elements)
-        return self._bounded_zeta(raw)
-
-    def _compute_zeta_state_input(self, u_k, z_prev, x_prev, A_diag):
         z_re, z_im, x_re, x_im = self._state_features(z_prev, x_prev)
 
         raw = (
-            self.si_u_to_zeta(u_k)
-            + self.si_w_z_re * z_re
-            + self.si_w_z_im * z_im
-            + self.si_w_x_re * x_re
-            + self.si_w_x_im * x_im
-            + self.si_bias
-        )
+            self.state_w_z_re * z_re
+            + self.state_w_z_im * z_im
+            + self.state_w_x_re * x_re
+            + self.state_w_x_im * x_im
+            + self.state_bias
+        )  # (P,)
 
-        if self.gate_variant == "energy":
-            energy = self._local_energy(z_prev, x_prev, A_diag)
-            raw = raw + self.si_rho * energy
+        mult = self.mult_min + (self.mult_max - self.mult_min) * nn.sigmoid(raw)
+        return mult
 
-        return self._bounded_zeta(raw)
 
-    # ------------------------------------------------------------------
-    # state packing helpers
-    # ------------------------------------------------------------------
 
     def _pack_state_real(self, z, x):
+        """
+        Pack complex oscillator state into real per-mode blocks.
+
+        z, x: (P,) complex
+        returns: (P, 4) real
+            [Re(z), Im(z), Re(x), Im(x)]
+        """
         return jnp.stack(
             [jnp.real(z), jnp.imag(z), jnp.real(x), jnp.imag(x)],
             axis=1,
         )
 
     def _unpack_state_real(self, packed):
+        """
+        packed: (P, 4) real
+        returns:
+          z: (P,) complex
+          x: (P,) complex
+        """
         z = packed[:, 0] + 1j * packed[:, 1]
         x = packed[:, 2] + 1j * packed[:, 3]
         return z, x
 
-    # ------------------------------------------------------------------
-    # scan-compatible input path
-    # ------------------------------------------------------------------
+    def _sigmoid_prime(self, x):
+        s = nn.sigmoid(x)
+        return s * (1.0 - s)
 
-    def _compute_G_seq_input(self, input_sequence, Bu_elements, A_diag, dt):
-        omega = self._omega_from_A(A_diag)
-        zeta_seq = self._compute_zeta_input_seq(input_sequence, Bu_elements)
-        G_seq = 2.0 * omega[None, :] * zeta_seq
+    
+    def _compute_state_input_multiplier(self, u_k, z_prev, x_prev):
+        """
+        State-input-dependent multiplier m_k in [mult_min, mult_max],
+        with full input dependence and local per-mode state dependence.
+        """
+        if self.gate_type != "linear":
+            raise NotImplementedError(f"gate_type={self.gate_type} not implemented yet.")
 
+        z_re, z_im, x_re, x_im = self._state_features(z_prev, x_prev)
+
+        u_term = self.state_input_u_linear(u_k)  # (P,)
+
+        raw = (
+            u_term
+            + self.state_input_w_z_re * z_re
+            + self.state_input_w_z_im * z_im
+            + self.state_input_w_x_re * x_re
+            + self.state_input_w_x_im * x_im
+            + self.state_input_bias
+        )  # (P,)
+
+        mult = self.mult_min + (self.mult_max - self.mult_min) * nn.sigmoid(raw)
+        return mult
+    
+
+    def _compute_G_seq(self, input_sequence, G_base, A_diag, dt):
+        """
+        Build G_seq depending on damping_mode.
+        Returns shape (L, P).
+        """
+        L = input_sequence.shape[0]
+        B_complex = self.B[..., 0] + 1j * self.B[..., 1]
+        Bu_elements = jax.vmap(lambda u: B_complex @ u)(input_sequence)   # (L, P)
+
+        if self.damping_mode == "constant":
+            G_seq = jnp.broadcast_to(G_base[None, :], (L, self.state_dim))
+        elif self.damping_mode == "input":
+            if self.freq_aware_damping:
+                omega = jnp.sqrt(jnp.maximum(A_diag, 1e-8))          # (P,)
+                zeta_seq = self._compute_zeta_seq(input_sequence, Bu_elements)
+                G_seq = 2.0 * omega[None, :] * zeta_seq
+            else:
+                mult = self._compute_multiplier(input_sequence, Bu_elements)
+                G_seq = G_base[None, :] * mult
+            
+        else:
+            raise NotImplementedError(
+                f"damping_mode={self.damping_mode} not implemented in DampedIMEX1Layer."
+            )
+
+
+        # Project each timestep G against static A, dt
         def project_one_g(g):
             A_proj, g_proj = self._project_G(g, A_diag, dt)
             return A_proj, g_proj
 
         A_seq, G_seq = jax.vmap(project_one_g)(G_seq)
+
+        # Since A should remain static across time, take the tightest stable version:
         A_diag_final = jnp.min(A_seq, axis=0)
         return A_diag_final, G_seq
+        # for G compatible with A fixed
+        # G_seq = jax.vmap(lambda g: self._project_G(g, A_diag, dt))(G_seq)
+        # return A_diag, G_seq
 
-    def _recurrence(self, A_diag, G_seq, dt, Bu_elements):
-        I = jnp.ones_like(A_diag)
-        dt_row = dt[None, :]
-        A_row = A_diag[None, :]
 
-        S = I[None, :] + dt_row * G_seq
-        M_11 = 1.0 / S
-        M_12 = -(dt_row / S) * A_row
-        M_21 = dt_row / S
-        M_22 = 1.0 - (dt_row**2 / S) * A_row
+    def _step_state_input(self, packed_state, u_k, A_diag, G_base, dt, B_complex):
+        """
+        packed_state: (P, 2) complex where [:,0]=z, [:,1]=x
+        u_k: (H,)
+        returns: next packed state (P, 2)
+        """
+        z_prev = packed_state[:, 0]
+        x_prev = packed_state[:, 1]
 
-        M_elements = jnp.concatenate([M_11, M_12, M_21, M_22], axis=1)
+        bu_k = B_complex @ u_k                              # (P,)
+        mult_k = self._compute_state_input_multiplier(u_k, z_prev, x_prev)  # (P,)
+        G_k_raw = G_base * mult_k
 
-        F1 = dt_row * (1.0 / S) * Bu_elements
-        F2 = (dt_row**2) * (1.0 / S) * Bu_elements
-        F = jnp.concatenate([F1, F2], axis=1)
+        # current projection style
+        A_k, G_k = self._project_G(G_k_raw, A_diag, dt)
 
-        _, xs = jax.lax.associative_scan(binary_operator, (M_elements, F))
-        ys = xs[:, self.state_dim:]
-        return ys
+        S = 1.0 + dt * G_k
+        z_next = (z_prev - dt * A_k * x_prev + dt * bu_k) / S
+        x_next = x_prev + dt * z_next
 
-    # ------------------------------------------------------------------
-    # sequential state-input path
-    # ------------------------------------------------------------------
+        return jnp.stack([z_next, x_next], axis=1)   # (P, 2)
 
-    def _recurrence_state_input(self, A_diag, dt, Bu_elements, input_sequence):
-        omega = self._omega_from_A(A_diag)
 
-        def step_fn(carry, xs):
-            z_prev, x_prev = carry
-            bu_k, u_k = xs
+    def _step_state(self, packed_state, u_k, A_diag, G_base, dt, B_complex):
+        z_prev = packed_state[:, 0]
+        x_prev = packed_state[:, 1]
 
-            zeta_k = self._compute_zeta_state_input(u_k, z_prev, x_prev, A_diag)
-            G_k_raw = 2.0 * omega * zeta_k
+        bu_k = B_complex @ u_k
+        mult_k = self._compute_state_multiplier(z_prev, x_prev)
+        G_k_raw = G_base * mult_k
+        A_k, G_k = self._project_G(G_k_raw, A_diag, dt)
 
-            A_k, G_k = self._project_G(G_k_raw, A_diag, dt)
+        S = 1.0 + dt * G_k
+        z_next = (z_prev - dt * A_k * x_prev + dt * bu_k) / S
+        x_next = x_prev + dt * z_next
 
-            S = 1.0 + dt * G_k
-            z_next = (z_prev - dt * A_k * x_prev + dt * bu_k) / S
-            x_next = x_prev + dt * z_next
+        return jnp.stack([z_next, x_next], axis=1)
 
-            return (z_next, x_next), x_next
 
-        z0 = jnp.zeros((self.state_dim,), dtype=Bu_elements.dtype)
-        x0 = jnp.zeros((self.state_dim,), dtype=Bu_elements.dtype)
-        (_, _), ys = jax.lax.scan(step_fn, (z0, x0), (Bu_elements, input_sequence))
-        return ys
-
-    # ------------------------------------------------------------------
-    # unified local linearizer for DEER
-    # ------------------------------------------------------------------
-
-    def _local_linearization_state_input(self, local_state, local_driver):
+    # local jacobian block builder for state
+    def _local_linearization_state(self, local_state, local_driver):
         """
         local_state: (4,) = [zr, zi, xr, xi]
-
         local_driver:
-          [a_i, dt_i, bu_re, bu_im, u_term_i,
-           w_z_re_i, w_z_im_i, w_x_re_i, w_x_im_i, bias_i, rho_i]
+          [a_i, g_base_i, dt_i, bu_re, bu_im,
+           w_z_re_i, w_z_im_i, w_x_re_i, w_x_im_i, bias_i]
+        Returns:
+          A_block: (4,4)
+          b_vec:   (4,)
         """
         (
-            a_i, dt_i, bu_re, bu_im, u_term_i,
-            w_z_re_i, w_z_im_i, w_x_re_i, w_x_im_i, bias_i, rho_i
+            a_i, g_base_i, dt_i, bu_re, bu_im,
+            w_z_re_i, w_z_im_i, w_x_re_i, w_x_im_i, bias_i
         ) = local_driver
 
         zr, zi, xr, xi = local_state
+        z_prev = zr + 1j * zi
+        x_prev = xr + 1j * xi
+        bu_i = bu_re + 1j * bu_im
+
+        raw = (
+            w_z_re_i * zr
+            + w_z_im_i * zi
+            + w_x_re_i * xr
+            + w_x_im_i * xi
+            + bias_i
+        )
+
+        sig = nn.sigmoid(raw)
+        sigp = self._sigmoid_prime(raw)
+
+        mult_i = self.mult_min + (self.mult_max - self.mult_min) * sig
+        dmult_draw = (self.mult_max - self.mult_min) * sigp
+
+        g_raw = g_base_i * mult_i
+
+        A_i_arr, G_i_arr = self._project_G(
+            jnp.array([g_raw]),
+            jnp.array([a_i]),
+            jnp.array([dt_i]),
+        )
+        A_i = A_i_arr[0]
+        G_i = G_i_arr[0]
+
+        # Treat projection as fixed in the linearization
+        # i.e. do not differentiate through the projection clamp
+        dg_dzr = g_base_i * dmult_draw * w_z_re_i
+        dg_dzi = g_base_i * dmult_draw * w_z_im_i
+        dg_dxr = g_base_i * dmult_draw * w_x_re_i
+        dg_dxi = g_base_i * dmult_draw * w_x_im_i
+
+        S = 1.0 + dt_i * G_i
+
+        N_re = zr + dt_i * (-A_i * xr + bu_re)
+        N_im = zi + dt_i * (-A_i * xi + bu_im)
+
+        d_invS_dzr = -(dt_i / (S ** 2)) * dg_dzr
+        d_invS_dzi = -(dt_i / (S ** 2)) * dg_dzi
+        d_invS_dxr = -(dt_i / (S ** 2)) * dg_dxr
+        d_invS_dxi = -(dt_i / (S ** 2)) * dg_dxi
+
+        # z_next real
+        dzr_dzr = 1.0 / S + N_re * d_invS_dzr
+        dzr_dzi = N_re * d_invS_dzi
+        dzr_dxr = (-dt_i * A_i) / S + N_re * d_invS_dxr
+        dzr_dxi = N_re * d_invS_dxi
+
+        # z_next imag
+        dzi_dzr = N_im * d_invS_dzr
+        dzi_dzi = 1.0 / S + N_im * d_invS_dzi
+        dzi_dxr = N_im * d_invS_dxr
+        dzi_dxi = (-dt_i * A_i) / S + N_im * d_invS_dxi
+
+        # x_next = x_prev + dt * z_next
+        dxr_dzr = dt_i * dzr_dzr
+        dxr_dzi = dt_i * dzr_dzi
+        dxr_dxr = 1.0 + dt_i * dzr_dxr
+        dxr_dxi = dt_i * dzr_dxi
+
+        dxi_dzr = dt_i * dzi_dzr
+        dxi_dzi = dt_i * dzi_dzi
+        dxi_dxr = dt_i * dzi_dxr
+        dxi_dxi = 1.0 + dt_i * dzi_dxi
+
+        A_block = jnp.array([
+            [dzr_dzr, dzr_dzi, dzr_dxr, dzr_dxi],
+            [dzi_dzr, dzi_dzi, dzi_dxr, dzi_dxi],
+            [dxr_dzr, dxr_dzi, dxr_dxr, dxr_dxi],
+            [dxi_dzr, dxi_dzi, dxi_dxr, dxi_dxi],
+        ])
+
+        next_state = jnp.array([
+            N_re / S,
+            N_im / S,
+            xr + dt_i * (N_re / S),
+            xi + dt_i * (N_im / S),
+        ])
+
+        b_vec = next_state - A_block @ local_state
+        return A_block, b_vec
+
+
+
+    def _local_linearization_state_input(self, local_state, local_driver):
+        """
+        local_driver:
+          [a_i, g_base_i, dt_i, bu_re, bu_im, u_term_i,
+           w_z_re_i, w_z_im_i, w_x_re_i, w_x_im_i, bias_i]
+        """
+        (
+            a_i, g_base_i, dt_i, bu_re, bu_im, u_term_i,
+            w_z_re_i, w_z_im_i, w_x_re_i, w_x_im_i, bias_i
+        ) = local_driver
+
+        zr, zi, xr, xi = local_state
+        z_prev = zr + 1j * zi
+        x_prev = xr + 1j * xi
+        bu_i = bu_re + 1j * bu_im
 
         raw = (
             u_term_i
@@ -606,28 +854,13 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
             + bias_i
         )
 
-        if self.gate_variant == "energy":
-            energy_i = a_i * (xr**2 + xi**2) + (zr**2 + zi**2)
-            raw = raw + rho_i * energy_i
-
-            draw_dzr = w_z_re_i + 2.0 * rho_i * zr
-            draw_dzi = w_z_im_i + 2.0 * rho_i * zi
-            draw_dxr = w_x_re_i + 2.0 * rho_i * a_i * xr
-            draw_dxi = w_x_im_i + 2.0 * rho_i * a_i * xi
-        else:
-            draw_dzr = w_z_re_i
-            draw_dzi = w_z_im_i
-            draw_dxr = w_x_re_i
-            draw_dxi = w_x_im_i
-
         sig = nn.sigmoid(raw)
         sigp = self._sigmoid_prime(raw)
 
-        zeta_i = self.zeta_min + (self.zeta_max - self.zeta_min) * sig
-        dzeta_draw = (self.zeta_max - self.zeta_min) * sigp
+        mult_i = self.mult_min + (self.mult_max - self.mult_min) * sig
+        dmult_draw = (self.mult_max - self.mult_min) * sigp
 
-        omega_i = jnp.sqrt(jnp.maximum(a_i, 1e-8))
-        g_raw = 2.0 * omega_i * zeta_i
+        g_raw = g_base_i * mult_i
 
         A_i_arr, G_i_arr = self._project_G(
             jnp.array([g_raw]),
@@ -637,20 +870,20 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
         A_i = A_i_arr[0]
         G_i = G_i_arr[0]
 
-        dg_dzr = 2.0 * omega_i * dzeta_draw * draw_dzr
-        dg_dzi = 2.0 * omega_i * dzeta_draw * draw_dzi
-        dg_dxr = 2.0 * omega_i * dzeta_draw * draw_dxr
-        dg_dxi = 2.0 * omega_i * dzeta_draw * draw_dxi
+        dg_dzr = g_base_i * dmult_draw * w_z_re_i
+        dg_dzi = g_base_i * dmult_draw * w_z_im_i
+        dg_dxr = g_base_i * dmult_draw * w_x_re_i
+        dg_dxi = g_base_i * dmult_draw * w_x_im_i
 
         S = 1.0 + dt_i * G_i
 
         N_re = zr + dt_i * (-A_i * xr + bu_re)
         N_im = zi + dt_i * (-A_i * xi + bu_im)
 
-        d_invS_dzr = -(dt_i / (S**2)) * dg_dzr
-        d_invS_dzi = -(dt_i / (S**2)) * dg_dzi
-        d_invS_dxr = -(dt_i / (S**2)) * dg_dxr
-        d_invS_dxi = -(dt_i / (S**2)) * dg_dxi
+        d_invS_dzr = -(dt_i / (S ** 2)) * dg_dzr
+        d_invS_dzi = -(dt_i / (S ** 2)) * dg_dzi
+        d_invS_dxr = -(dt_i / (S ** 2)) * dg_dxr
+        d_invS_dxi = -(dt_i / (S ** 2)) * dg_dxi
 
         dzr_dzr = 1.0 / S + N_re * d_invS_dzr
         dzr_dzi = N_re * d_invS_dzi
@@ -688,97 +921,221 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
 
         b_vec = next_state - A_block @ local_state
         return A_block, b_vec
+   
 
-    def _run_block_deer(self, input_sequence, A_diag, dt, B_complex):
+
+    def _recurrence(self, A_diag, G_seq, dt, Bu_elements):
+        """
+        Time-varying recurrence for DampedIMEX1.
+        Args:
+            A_diag      (P,)
+            G_seq       (L, P)
+            dt          (P,)
+            Bu_elements (L, P)
+        Returns:
+            ys          (L, P)
+        """
+        I = jnp.ones_like(A_diag)
+        dt_row = dt[None, :]
+        A_row = A_diag[None, :]
+
+        S = I[None, :] + dt_row * G_seq
+        M_11 = 1.0 / S
+        M_12 = -(dt_row / S) * A_row
+        M_21 = dt_row / S
+        M_22 = 1.0 - (dt_row**2 / S) * A_row
+
+        M_elements = jnp.concatenate([M_11, M_12, M_21, M_22], axis=1)
+
+        F1 = dt_row * (1.0 / S) * Bu_elements
+        F2 = (dt_row**2) * (1.0 / S) * Bu_elements
+        F = jnp.concatenate([F1, F2], axis=1)
+
+        _, xs = jax.lax.associative_scan(binary_operator, (M_elements, F))
+        ys = xs[:, self.state_dim:]  # Position component
+        return ys
+
+
+
+    def _recurrence_state(self, A_diag, G_base, dt, Bu_elements):
+        """
+        Sequential recurrence for state-dependent damping.
+        Breaks associativity, so we use lax.scan instead of associative_scan.
+
+        State:
+            z_k, x_k  each shape (P,) complex
+        """
+        dt_row = dt
+
+        def step_fn(carry, bu_k):
+            z_prev, x_prev = carry  # each (P,) complex
+
+            # state-dependent multiplier
+            mult_k = self._compute_state_multiplier(z_prev, x_prev)   # (P,)
+            G_k_raw = G_base * mult_k                                 # (P,)
+
+            # keep current projection style: choose G, then project A against it
+            A_k, G_k = self._project_G(G_k_raw, A_diag, dt_row)
+
+            S = 1.0 + dt_row * G_k
+            z_next = (z_prev - dt_row * A_k * x_prev + dt_row * bu_k) / S
+            x_next = x_prev + dt_row * z_next
+
+            return (z_next, x_next), x_next
+
+        z0 = jnp.zeros((self.state_dim,), dtype=Bu_elements.dtype)
+        x0 = jnp.zeros((self.state_dim,), dtype=Bu_elements.dtype)
+
+        (_, _), ys = jax.lax.scan(step_fn, (z0, x0), Bu_elements)
+        return ys
+
+
+    def _recurrence_state_input(self, A_diag, G_base, dt, Bu_elements, input_sequence):
+        """
+        Sequential recurrence for state-input-dependent damping.
+        State:
+            z_k, x_k each shape (P,) complex
+        """
+        dt_row = dt
+
+        def step_fn(carry, xs):
+            z_prev, x_prev = carry
+            bu_k, u_k = xs
+
+            mult_k = self._compute_state_input_multiplier(u_k, z_prev, x_prev)  # (P,)
+            G_k_raw = G_base * mult_k
+
+            # same current projection style: choose G, then project A against it
+            A_k, G_k = self._project_G(G_k_raw, A_diag, dt_row)
+
+            S = 1.0 + dt_row * G_k
+            z_next = (z_prev - dt_row * A_k * x_prev + dt_row * bu_k) / S
+            x_next = x_prev + dt_row * z_next
+
+            return (z_next, x_next), x_next
+
+        z0 = jnp.zeros((self.state_dim,), dtype=Bu_elements.dtype)
+        x0 = jnp.zeros((self.state_dim,), dtype=Bu_elements.dtype)
+
+        (_, _), ys = jax.lax.scan(step_fn, (z0, x0), (Bu_elements, input_sequence))
+        return ys
+
+
+    def _run_block_deer(self, input_sequence, A_diag, G_base, dt, B_complex, state_input=False):
         P = self.state_dim
         T = input_sequence.shape[0]
 
         initial_packed = jnp.zeros((P, 4), dtype=jnp.float32)
         states_guess = jnp.zeros((T, P, 4), dtype=jnp.float32)
 
-        Bu_elements = jax.vmap(lambda u: B_complex @ u)(input_sequence)
-        u_terms = jax.vmap(self.si_u_to_zeta)(input_sequence)
+        Bu_elements = jax.vmap(lambda u: B_complex @ u)(input_sequence)   # (T,P)
 
-        if self.gate_variant == "energy":
-            rho = self.si_rho
+        if state_input:
+            u_terms = jax.vmap(self.state_input_u_linear)(input_sequence)  # (T,P)
+
+            local_drivers = jnp.stack([
+                jnp.broadcast_to(A_diag[None, :], (T, P)),
+                jnp.broadcast_to(G_base[None, :], (T, P)),
+                jnp.broadcast_to(dt[None, :], (T, P)),
+                jnp.real(Bu_elements),
+                jnp.imag(Bu_elements),
+                u_terms,
+                jnp.broadcast_to(self.state_input_w_z_re[None, :], (T, P)),
+                jnp.broadcast_to(self.state_input_w_z_im[None, :], (T, P)),
+                jnp.broadcast_to(self.state_input_w_x_re[None, :], (T, P)),
+                jnp.broadcast_to(self.state_input_w_x_im[None, :], (T, P)),
+                jnp.broadcast_to(self.state_input_bias[None, :], (T, P)),
+            ], axis=-1)
+
+            local_linearizer = self._local_linearization_state_input
         else:
-            rho = jnp.zeros((P,))
+            local_drivers = jnp.stack([
+                jnp.broadcast_to(A_diag[None, :], (T, P)),
+                jnp.broadcast_to(G_base[None, :], (T, P)),
+                jnp.broadcast_to(dt[None, :], (T, P)),
+                jnp.real(Bu_elements),
+                jnp.imag(Bu_elements),
+                jnp.broadcast_to(self.state_w_z_re[None, :], (T, P)),
+                jnp.broadcast_to(self.state_w_z_im[None, :], (T, P)),
+                jnp.broadcast_to(self.state_w_x_re[None, :], (T, P)),
+                jnp.broadcast_to(self.state_w_x_im[None, :], (T, P)),
+                jnp.broadcast_to(self.state_bias[None, :], (T, P)),
+            ], axis=-1)
 
-        local_drivers = jnp.stack([
-            jnp.broadcast_to(A_diag[None, :], (T, P)),
-            jnp.broadcast_to(dt[None, :], (T, P)),
-            jnp.real(Bu_elements),
-            jnp.imag(Bu_elements),
-            u_terms,
-            jnp.broadcast_to(self.si_w_z_re[None, :], (T, P)),
-            jnp.broadcast_to(self.si_w_z_im[None, :], (T, P)),
-            jnp.broadcast_to(self.si_w_x_re[None, :], (T, P)),
-            jnp.broadcast_to(self.si_w_x_im[None, :], (T, P)),
-            jnp.broadcast_to(self.si_bias[None, :], (T, P)),
-            jnp.broadcast_to(rho[None, :], (T, P)),
-        ], axis=-1)
+            local_linearizer = self._local_linearization_state
 
         def build_linearization(states):
+            # states: (T,P,4)
             if T == 1:
-                A0, b0 = jax.vmap(self._local_linearization_state_input)(
-                    initial_packed, local_drivers[0]
-                )
+                A0, b0 = jax.vmap(local_linearizer)(initial_packed, local_drivers[0])
                 return A0[None, ...], b0[None, ...]
 
             A_rest, b_rest = jax.vmap(
-                lambda states_t, drivers_t: jax.vmap(self._local_linearization_state_input)(
-                    states_t, drivers_t
-                )
+                lambda states_t, drivers_t: jax.vmap(local_linearizer)(states_t, drivers_t)
             )(states[:-1], local_drivers[1:])
 
-            A0, b0 = jax.vmap(self._local_linearization_state_input)(
-                initial_packed, local_drivers[0]
-            )
+            A0, b0 = jax.vmap(local_linearizer)(initial_packed, local_drivers[0])
 
             A = jnp.concatenate([A0[None, ...], A_rest], axis=0)
             b = jnp.concatenate([b0[None, ...], b_rest], axis=0)
             return A, b
 
-
         final_states, _ = block_deer_rollout_from_linearizer(
             build_linearization=build_linearization,
             states_guess=states_guess,
             num_iters=self.deer_num_iters,
-            mix=self.deer_damping,
         )
 
         _, x_states = jax.vmap(self._unpack_state_real)(final_states)
         return x_states
 
-    # ------------------------------------------------------------------
-    # forward
-    # ------------------------------------------------------------------
-
     def __call__(self, input_sequence):
+        # Materialize parameters
         B_complex = self.B[..., 0] + 1j * self.B[..., 1]
         C_complex = self.C[..., 0] + 1j * self.C[..., 1]
 
+        # Project static parameters
         A_diag, dt = self._project_A_dt(self.A_diag, self.dt)
-        _, G_base = self._project_G(self.G_diag, A_diag, dt)  # kept for constant baseline
 
+        # Static baseline damping
+        _, G_base = self._project_G(self.G_diag, A_diag, dt)
+        # G_base = self._project_G(self.G_diag, A_diag, dt)
+
+        # Input projection for forcing term
         Bu_elements = jax.vmap(lambda u: B_complex @ u)(input_sequence)
 
-        if self.damping_mode == "constant":
-            G_seq = jnp.broadcast_to(G_base[None, :], (input_sequence.shape[0], self.state_dim))
-            ys = self._recurrence(A_diag, G_seq, dt, Bu_elements)
-
-        elif self.damping_mode == "input":
-            A_diag_eff, G_seq = self._compute_G_seq_input(
-                input_sequence, Bu_elements, A_diag, dt
-            )
+        # Run recurrence
+        if self.damping_mode in ["constant", "input"]:
+            A_diag_eff, G_seq = self._compute_G_seq(input_sequence, G_base, A_diag, dt)
             ys = self._recurrence(A_diag_eff, G_seq, dt, Bu_elements)
+        
+    
+        elif self.damping_mode == "state":
+            if self.use_block_deer:
+                ys = self._run_block_deer(
+                    input_sequence,
+                    A_diag,
+                    G_base,
+                    dt,
+                    B_complex,
+                    state_input=False,
+                )
+            else:
+                ys = self._recurrence_state(A_diag, G_base, dt, Bu_elements)
 
         elif self.damping_mode == "state_input":
             if self.use_block_deer:
-                ys = self._run_block_deer(input_sequence, A_diag, dt, B_complex)
+                ys = self._run_block_deer(
+                    input_sequence,
+                    A_diag,
+                    G_base,
+                    dt,
+                    B_complex,
+                    state_input=True,
+                )
             else:
-                ys = self._recurrence_state_input(A_diag, dt, Bu_elements, input_sequence)
-
+                ys = self._recurrence_state_input(A_diag, G_base, dt, Bu_elements, input_sequence)
+                
         else:
             raise NotImplementedError(
                 f"damping_mode={self.damping_mode} not implemented in DampedIMEX1Layer."
@@ -786,6 +1143,8 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
 
         xs = jax.vmap(lambda x, u: (C_complex @ x).real + self.D * u)(ys, input_sequence)
         return xs
+    
+    
 
 
 
@@ -1376,9 +1735,6 @@ class LinOSSBlock(eqx.Module):
             G_max=G_max,
             dt_std=dt_std,
             damping_mode=kwargs.get("damping_mode", "constant"),
-
-            gate_variant=kwargs.get("gate_variant", "simple"),
-
             gate_type=kwargs.get("gate_type", "linear"),
             mult_min=kwargs.get("mult_min", 0.25),
             mult_max=kwargs.get("mult_max", 4.0),
@@ -1389,6 +1745,10 @@ class LinOSSBlock(eqx.Module):
             use_block_deer=kwargs.get("use_block_deer", False),
             deer_num_iters=kwargs.get("deer_num_iters", 4),
             deer_damping=kwargs.get("deer_damping", 0.0),
+
+            gate_hidden_dim = kwargs.get("gate_hidden_dim", 64),
+            gate_nonlinearity= kwargs.get("gate_nonlinearity", "gelu"),
+            gate_use_energy= kwargs.get("gate_use_energy", False),
             key=ssmkey,
         )
         self.glu = GLU(hidden_dim, hidden_dim, key=glukey)
@@ -1415,6 +1775,7 @@ class LinOSS(eqx.Module):
     classification: bool
     tanh_output: bool
     output_step: int
+    task_type: str
     stateful: bool = True
     nondeterministic: bool = True
 
@@ -1440,7 +1801,6 @@ class LinOSS(eqx.Module):
         G_max: float, 
         dt_std: float, 
         drop_rate: float,
-        gate_variant: str = "simple",
         damping_mode: str = "constant",
         gate_type: str = "linear",
         mult_min: float = 0.25,
@@ -1451,6 +1811,10 @@ class LinOSS(eqx.Module):
         use_block_deer: bool = False,
         deer_num_iters: int = 4,
         deer_damping: float = 0.0,
+        task_type: str = "sequence",
+        gate_hidden_dim: int = 64,
+        gate_nonlinearity: str = "gelu",
+        gate_use_energy: bool = False,
         key: PRNGKeyArray=None,
         **kwargs,
     ):
@@ -1474,7 +1838,6 @@ class LinOSS(eqx.Module):
                 G_max=G_max, 
                 dt_std=dt_std, 
                 drop_rate=drop_rate,
-                gate_variant=gate_variant,
                 damping_mode=damping_mode,
                 gate_type=gate_type,
                 mult_min=mult_min,
@@ -1485,6 +1848,9 @@ class LinOSS(eqx.Module):
                 use_block_deer=use_block_deer,
                 deer_num_iters=deer_num_iters,
                 deer_damping=deer_damping,
+                gate_hidden_dim=gate_hidden_dim,
+                gate_nonlinearity=gate_nonlinearity,
+                gate_use_energy=gate_use_energy,
                 key=key,
             )
             for key in block_keys
@@ -1494,6 +1860,7 @@ class LinOSS(eqx.Module):
         self.classification = classification
         self.tanh_output = tanh_output
         self.output_step = output_step
+        self.task_type = task_type
 
     def __call__(self, x, state, key):
         dropkeys = jr.split(key, len(self.blocks))
@@ -1503,9 +1870,34 @@ class LinOSS(eqx.Module):
             x, state = block(x, state, key=key)
 
         if self.classification:
-            x = jnp.mean(x, axis=0)
-            x = self.linear_decoder(x)
-            x = jax.nn.softmax(x, axis=0)
+            if self.task_type == "token":        # selective copy
+                x = jax.vmap(self.linear_decoder)(x)
+                x = jax.nn.softmax(x, axis=-1)
+
+            elif self.task_type == "sequence":   # generic classification
+                x = jnp.mean(x, axis=0)
+                x = self.linear_decoder(x)
+                x = jax.nn.softmax(x, axis=-1)
+
+            elif self.task_type == "induction":  # induction head
+                x = x[-1]
+                x = self.linear_decoder(x)
+                x = jax.nn.softmax(x, axis=-1)
+        
+        # if self.classification:
+        #     # for selective copy task
+        #     # x = jax.vmap(self.linear_decoder)(x)   # (T, C)
+        #     # x = jax.nn.softmax(x, axis=-1)
+
+        #     # original code 
+        #     # x = jnp.mean(x, axis=0)
+        #     # x = self.linear_decoder(x)
+        #     # x = jax.nn.softmax(x, axis=0)
+
+        #     # for induction head task 
+        #     x = x[-1]   # final timestep for sequence-to-one tasks like induction
+        #     x = self.linear_decoder(x)
+        #     x = jax.nn.softmax(x, axis=-1)
         else:
             x = x[self.output_step - 1 :: self.output_step]
             x = jax.vmap(self.linear_decoder)(x)

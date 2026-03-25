@@ -16,10 +16,10 @@ import numpy as np
 
 def create_grid_experiment(experiment_folder, model_name, dataset_name):
     # Hyperparameter sweep
-    seed = [3, 4, 5] #[0, 1, 2]
-    damping_mode = ["state_input"]
+    seed = [1, 0, 2] # [3, 4, 5] 
+    damping_mode = ["constant"]
 
-    lr = [1e-4]
+    lr = [1e-3]
     state_dim = [128]
     hidden_dim = [128]
     num_blocks = [2] # [2, 4, 6]
@@ -36,7 +36,7 @@ def create_grid_experiment(experiment_folder, model_name, dataset_name):
             "classification": False,
             "use_presplit": True,
             "output_step": 1,
-            "num_steps": 10000,
+            "num_steps": 300000,
             "print_steps": 100,
             "batch_size": 32,
             "lr": _learning_rate,
@@ -47,18 +47,22 @@ def create_grid_experiment(experiment_folder, model_name, dataset_name):
             "time_duration": 1.0,
             "tanh_output": False,
 
-            "gate_variant": "energy",
             "layer_name": "DampedIMEX1",
             "damping_mode": _damping_mode,   # or "constant" for baseline
             "gate_type": "linear",
+            "freq_aware_damping": False, # set to False for ordinary input dependent damping 
             "zeta_min": 0.0,
             "zeta_max": 4.0,
-            # "mult_min": 0.5,
-            # "mult_max": 1.5,
-            # "freq_aware_damping": False, # set to False for ordinary input dependent damping 
+            "mult_min": 0.1,
+            "mult_max": 6.0,
 
+            "gate_hidden_dim": 64,
+            "gate_nonlinearity": "gelu",
+            "gate_use_energy": False,
+            # "input_dim": 4,
+            # "output_dim": 1,
 
-            "use_block_deer": True,
+            "use_block_deer": False,
             "deer_num_iters":2,
             "deer_damping": 0.1,
             
@@ -77,6 +81,10 @@ def create_grid_experiment(experiment_folder, model_name, dataset_name):
             "G_max": 1.0,
             "dt_std": 0.5,
             "drop_rate": 0.1,
+
+            # change based on task being adding, induction or copy
+            "task_type": "sequence", #sequence for adding task, induction for induction head, token for sel. copy 
+
 
         }
 
@@ -178,8 +186,8 @@ def create_random_experiment(experiment_folder, model_name, dataset_name):
 
 if __name__ == "__main__":
     model_name = "LinOSS"
-    dataset_name = "Adding500"
-    experiment_folder = f"experiments/SI-energy-S345-LinOSS-IMEX1/{dataset_name}/"
+    dataset_name = "WriteHoldEraseQuery"
+    experiment_folder = f"experiments/ConstD-S012-LinOSS-IMEX1/{dataset_name}/"
 
     if os.path.exists(experiment_folder):
         raise RuntimeError("Experiment already exists!")

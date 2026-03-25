@@ -8,7 +8,9 @@ import jax.random as jr
 import jax.nn
 
 from damped_linoss.data.dataloader import BaseDataloader, StandardDataloader, BucketedDataloader
+from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parent.parent
 
 # =============================================
 # SECTION: Utility functions
@@ -783,6 +785,471 @@ def load_Adding5000_dataset():
     return data, labels, lambda x: x
 
 
+
+
+# def _generate_selective_copy_batch(
+#     bsz,
+#     L,
+#     M,
+#     A,
+#     key,
+#     n_distractors=0,
+#     hard_negatives=False,
+#     variable_length=False,
+#     min_M=4,
+#     marker_repeat=None,
+#     distractor_near_end=False,
+#     ):
+#     """
+#     Harder selective copying task.
+
+#     Input:
+#       - first prefix region has true memory tokens scattered randomly
+#       - optional distractors, including hard negatives
+#       - final marker block indicates recall region
+
+#     Output:
+#       - the true memory tokens in the order they appeared
+#       - padded to length M if variable_length=True
+#       - labels shape: (bsz, M, A)
+
+#     Token semantics:
+#       0       = blank/noise
+#       1..A-2  = normal tokens
+#       A-1     = marker token
+#     """
+#     key_tok, key_pos, key_aux = jr.split(key, 3)
+
+#     if marker_repeat is None:
+#         marker_repeat = M
+
+#     # choose per-example memory length
+#     if variable_length:
+#         key_len, key_tok = jr.split(key_tok)
+#         mem_lengths = jr.randint(key_len, shape=(bsz,), minval=min_M, maxval=M + 1)
+#     else:
+#         mem_lengths = jnp.full((bsz,), M)
+
+#     # sample full-size token bank, later mask unused
+#     tokens_full = jr.randint(key_tok, shape=(bsz, M), minval=1, maxval=A - 1)
+
+#     pos_keys = jr.split(key_pos, bsz)
+#     aux_keys = jr.split(key_aux, bsz)
+
+#     def build_one_example(tokens_row, m_len, k_pos, k_aux):
+#         prefix_len = L + M
+#         x_prefix = jnp.zeros((prefix_len,), dtype=jnp.int32)
+
+#         # choose true memory positions
+#         perm = jr.permutation(k_pos, prefix_len)
+#         mem_pos = jnp.sort(perm[:m_len])
+
+#         true_tokens = tokens_row[:m_len]
+#         x_prefix = x_prefix.at[mem_pos].set(true_tokens)
+
+#         # add distractors
+#         if n_distractors > 0:
+#             k_d1, k_d2 = jr.split(k_aux)
+
+#             occupied = jnp.zeros((prefix_len,), dtype=bool).at[mem_pos].set(True)
+#             avail = jnp.arange(prefix_len)[~occupied]
+
+#             if distractor_near_end:
+#                 # bias distractors toward the later part of prefix
+#                 avail = avail[avail >= max(0, prefix_len // 2)]
+
+#             num_avail = avail.shape[0]
+#             nd = jnp.minimum(n_distractors, num_avail)
+#             dperm = jr.permutation(k_d1, num_avail)
+#             dist_pos = jnp.sort(avail[dperm[:nd]])
+
+#             if hard_negatives:
+#                 # reuse true memory token identities as distractors
+#                 rep_perm = jr.permutation(k_d2, m_len)
+#                 base = true_tokens[rep_perm]
+#                 reps = jnp.tile(base, (nd + m_len - 1) // m_len)[:nd]
+#                 dist_tokens = reps
+#             else:
+#                 dist_tokens = jr.randint(k_d2, shape=(nd,), minval=1, maxval=A - 1)
+
+#             x_prefix = x_prefix.at[dist_pos].set(dist_tokens)
+
+#         # final markers
+#         markers = jnp.full((marker_repeat,), A - 1, dtype=jnp.int32)
+#         x_int = jnp.concatenate([x_prefix, markers], axis=0)
+
+#         # padded targets
+#         y_int = jnp.zeros((M,), dtype=jnp.int32)
+#         y_int = y_int.at[:m_len].set(true_tokens)
+
+#         return x_int, y_int
+
+#     x_int, y_int = jax.vmap(build_one_example)(tokens_full, mem_lengths, pos_keys, aux_keys)
+
+#     x = jax.nn.one_hot(x_int, A).astype(jnp.float32)   # (B, T, A)
+#     y = jax.nn.one_hot(y_int, A).astype(jnp.float32)   # (B, M, A)
+#     return x, y
+
+
+
+
+def _generate_selective_copy_batch(
+    bsz,
+    L,
+    M,
+    A,
+    key,
+    n_distractors=0,
+    hard_negatives=False,
+    variable_length=False,
+    min_M=4,
+    marker_repeat=None,
+    distractor_near_end=False,
+    ):
+    """
+    JAX-safe selective copy generator.
+
+    Input:
+      - prefix of length (L + M)
+      - true memory tokens are scattered at sparse positions
+      - optional distractors are inserted at other positions
+      - final marker block indicates recall region
+
+    Output:
+      - x: (B, T, A) one-hot
+      - y: (B, M, A) one-hot
+        If variable_length=True, inactive target positions are padded with token 0.
+
+    Token semantics:
+      0       = blank / pad
+      1..A-2  = ordinary tokens
+      A-1     = marker token
+    """
+    if marker_repeat is None:
+        marker_repeat = M
+
+    prefix_len = L + M
+
+    key_tok, key_pos, key_aux, key_len = jr.split(key, 4)
+
+    # full token bank, always length M
+    tokens_full = jr.randint(key_tok, shape=(bsz, M), minval=1, maxval=A - 1)
+
+    # choose memory lengths
+    if variable_length:
+        mem_lengths = jr.randint(key_len, shape=(bsz,), minval=min_M, maxval=M + 1)
+    else:
+        mem_lengths = jnp.full((bsz,), M)
+
+    pos_keys = jr.split(key_pos, bsz)
+    aux_keys = jr.split(key_aux, bsz)
+
+    def build_one_example(tokens_row, m_len, k_pos, k_aux):
+        active_mask = (jnp.arange(M) < m_len)  # (M,)
+
+        # choose M candidate memory positions; only first m_len are active
+        perm = jr.permutation(k_pos, prefix_len)
+        mem_pos_all = jnp.sort(perm[:M])       # static slice, safe
+
+        true_tokens = jnp.where(active_mask, tokens_row, 0).astype(jnp.int32)
+
+        # scatter only active memory positions
+        x_prefix = jnp.zeros((prefix_len,), dtype=jnp.int32)
+        scatter_vals = jnp.where(active_mask, tokens_row, 0)
+        x_prefix = x_prefix.at[mem_pos_all].set(scatter_vals)
+
+        if n_distractors > 0:
+            k_d1, k_d2 = jr.split(k_aux)
+
+            # occupied positions = active memory positions only
+            occupied = jnp.zeros((prefix_len,), dtype=bool)
+            occupied = occupied.at[mem_pos_all].set(active_mask)
+
+            # build a score vector so we can select allowed distractor positions
+            base_scores = jr.uniform(k_d1, shape=(prefix_len,))
+
+            # forbid occupied positions by sending score very negative
+            scores = jnp.where(occupied, -1e9, base_scores)
+
+            if distractor_near_end:
+                near_end_mask = (jnp.arange(prefix_len) >= (prefix_len // 2))
+                scores = jnp.where(near_end_mask, scores, -1e9)
+
+            nd = min(n_distractors, prefix_len)
+
+            # take top-k allowed positions; invalid positions remain at end with -1e9
+            _, dist_pos = jax.lax.top_k(scores, nd)
+            dist_pos = jnp.sort(dist_pos)
+
+            if hard_negatives:
+                # choose distractor tokens by reusing active true tokens
+                rep_perm = jr.permutation(k_d2, M)
+                base = tokens_row[rep_perm]
+                reps = jnp.tile(base, (nd + M - 1) // M)[:nd]
+                dist_tokens = reps
+            else:
+                dist_tokens = jr.randint(k_d2, shape=(nd,), minval=1, maxval=A - 1)
+
+            # mask out invalid distractor positions (those with score < 0)
+            valid_dist = (scores[dist_pos] > -1e8)
+            dist_tokens = jnp.where(valid_dist, dist_tokens, 0)
+
+            x_prefix = x_prefix.at[dist_pos].set(dist_tokens)
+
+        markers = jnp.full((marker_repeat,), A - 1, dtype=jnp.int32)
+        x_int = jnp.concatenate([x_prefix, markers], axis=0)
+        y_int = true_tokens
+
+        return x_int, y_int
+
+    x_int, y_int = jax.vmap(build_one_example)(tokens_full, mem_lengths, pos_keys, aux_keys)
+
+    x = jax.nn.one_hot(x_int, A).astype(jnp.float32)   # (B, T, A)
+    y = jax.nn.one_hot(y_int, A).astype(jnp.float32)   # (B, M, A)
+    return x, y
+
+
+def load_SelectiveCopy_dataset(
+    L=100,
+    M=10,
+    A=8,
+    n_distractors=0,
+    hard_negatives=False,
+    variable_length=False,
+    min_M=4,
+    marker_repeat=None,
+    distractor_near_end=False,
+):
+    size_train = 10000
+    size_val = 2000
+    size_test = 2000
+
+    train_key = jax.random.PRNGKey(0)
+    val_key = jax.random.PRNGKey(1)
+    test_key = jax.random.PRNGKey(2)
+
+    train_data, train_labels = _generate_selective_copy_batch(
+        size_train,
+        L,
+        M,
+        A,
+        train_key,
+        n_distractors=n_distractors,
+        hard_negatives=hard_negatives,
+        variable_length=variable_length,
+        min_M=min_M,
+        marker_repeat=marker_repeat,
+        distractor_near_end=distractor_near_end,
+    )
+
+    val_data, val_labels = _generate_selective_copy_batch(
+        size_val,
+        L,
+        M,
+        A,
+        val_key,
+        n_distractors=n_distractors,
+        hard_negatives=hard_negatives,
+        variable_length=variable_length,
+        min_M=min_M,
+        marker_repeat=marker_repeat,
+        distractor_near_end=distractor_near_end,
+    )
+
+    test_data, test_labels = _generate_selective_copy_batch(
+        size_test,
+        L,
+        M,
+        A,
+        test_key,
+        n_distractors=n_distractors,
+        hard_negatives=hard_negatives,
+        variable_length=variable_length,
+        min_M=min_M,
+        marker_repeat=marker_repeat,
+        distractor_near_end=distractor_near_end,
+    )
+
+    data = (train_data, val_data, test_data)
+    labels = (train_labels, val_labels, test_labels)
+    return data, labels, lambda x: x
+
+
+
+
+
+
+def _generate_induction_batch(bsz, seq_len, n_vocab, prefix_len, key):
+    """
+    Generate induction-head examples of the form
+
+      [random filler] [S, M] [random filler] [S]
+
+    where:
+      - S is the special induction token
+      - M is the token to be recalled at the end
+
+    Input:
+      x: (bsz, seq_len, n_vocab + 1) one-hot
+    Target:
+      y: (bsz, n_vocab) one-hot
+    """
+    special_tok = n_vocab
+    k_mem, k_pos, k_fill = jr.split(key, 3)
+
+    # memory token M in {0, ..., n_vocab-1}
+    mem_tok = jr.randint(k_mem, shape=(bsz,), minval=0, maxval=n_vocab)
+
+    # first occurrence position of S inside early prefix
+    first_pos = jr.randint(k_pos, shape=(bsz,), minval=0, maxval=prefix_len)
+
+    # Build filler tokens over normal vocab only
+    fill_keys = jr.split(k_fill, bsz)
+
+    def build_one_example(m_tok, p0, k):
+        # sequence length fixed = seq_len
+        # last token will be the second S
+        seq = jr.randint(k, shape=(seq_len,), minval=0, maxval=n_vocab)
+
+        # Put first [S, M]
+        seq = seq.at[p0].set(special_tok)
+        seq = seq.at[p0 + 1].set(m_tok)
+
+        # Put final S
+        seq = seq.at[seq_len - 1].set(special_tok)
+
+        # Optional: avoid accidental special token elsewhere
+        # already satisfied because filler sampled only from 0..n_vocab-1
+        return seq
+
+    x_int = jax.vmap(build_one_example)(mem_tok, first_pos, fill_keys)   # (bsz, seq_len)
+    y_int = mem_tok                                                       # (bsz,)
+
+    x = jax.nn.one_hot(x_int, n_vocab + 1).astype(jnp.float32)
+    y = jax.nn.one_hot(y_int, n_vocab).astype(jnp.float32)
+    return x, y
+
+def load_InductionHead_dataset(seq_len=256, n_vocab=16, prefix_len=10):
+    """
+    Mamba-style induction-head task:
+      train on fixed sequence length 256, vocab size 16, special token added.
+    """
+    size_train = 10000
+    size_val = 2000
+    size_test = 2000
+
+    train_key = jax.random.PRNGKey(10)
+    val_key = jax.random.PRNGKey(11)
+    test_key = jax.random.PRNGKey(12)
+
+    train_data, train_labels = _generate_induction_batch(size_train, seq_len, n_vocab, prefix_len, train_key)
+    val_data, val_labels = _generate_induction_batch(size_val, seq_len, n_vocab, prefix_len, val_key)
+    test_data, test_labels = _generate_induction_batch(size_test, seq_len, n_vocab, prefix_len, test_key)
+
+    data = (train_data, val_data, test_data)
+    labels = (train_labels, val_labels, test_labels)
+    return data, labels, lambda x: x
+    
+
+
+
+
+
+
+def _generate_mqar_batch(bsz, seq_len, n_vocab, n_pairs, key):
+    """
+    MQAR-style associative recall.
+
+    Construction:
+      prefix contains n_pairs distinct (key, value) pairs:
+         K1, V1, K2, V2, ..., Kn, Vn
+      middle contains filler tokens
+      final token is one queried key Kq
+      target is corresponding value Vq
+
+    Input:
+      x: (bsz, seq_len, n_vocab) one-hot
+    Target:
+      y: (bsz, n_vocab) one-hot
+    """
+    k_pairs, k_query, k_fill = jr.split(key, 3)
+
+    pair_keys = jr.split(k_pairs, bsz)
+    query_keys = jr.split(k_query, bsz)
+    fill_keys = jr.split(k_fill, bsz)
+
+    def build_one_example(kp, kq, kf):
+        # sample 2*n_pairs distinct tokens, first half keys, second half values
+        perm = jr.permutation(kp, n_vocab)
+        keys = perm[:n_pairs]
+        vals = perm[n_pairs:2 * n_pairs]
+
+        prefix = jnp.zeros((2 * n_pairs,), dtype=jnp.int32)
+        prefix = prefix.at[0::2].set(keys)
+        prefix = prefix.at[1::2].set(vals)
+
+        remaining = seq_len - (2 * n_pairs) - 1
+        filler = jr.randint(kf, shape=(remaining,), minval=0, maxval=n_vocab)
+
+        q_idx = jr.randint(kq, shape=(), minval=0, maxval=n_pairs)
+        query_key = keys[q_idx]
+        target_val = vals[q_idx]
+
+        seq = jnp.concatenate([prefix, filler, jnp.array([query_key])], axis=0)
+        return seq, target_val
+
+    x_int, y_int = jax.vmap(build_one_example)(pair_keys, query_keys, fill_keys)
+
+    x = jax.nn.one_hot(x_int, n_vocab).astype(jnp.float32)
+    y = jax.nn.one_hot(y_int, n_vocab).astype(jnp.float32)
+    return x, y
+
+
+def load_MQAR_dataset(seq_len=256, n_vocab=32, n_pairs=8):
+    size_train = 10000
+    size_val = 2000
+    size_test = 2000
+
+    train_key = jax.random.PRNGKey(20)
+    val_key = jax.random.PRNGKey(21)
+    test_key = jax.random.PRNGKey(22)
+
+    train_data, train_labels = _generate_mqar_batch(size_train, seq_len, n_vocab, n_pairs, train_key)
+    val_data, val_labels = _generate_mqar_batch(size_val, seq_len, n_vocab, n_pairs, val_key)
+    test_data, test_labels = _generate_mqar_batch(size_test, seq_len, n_vocab, n_pairs, test_key)
+
+    data = (train_data, val_data, test_data)
+    labels = (train_labels, val_labels, test_labels)
+    return data, labels, lambda x: x
+
+
+
+
+
+def load_presplit_pickle_dataset(data_dir):
+    with open(data_dir / "X_train.pkl", "rb") as f:
+        X_train = pickle.load(f)
+    with open(data_dir / "y_train.pkl", "rb") as f:
+        y_train = pickle.load(f)
+    with open(data_dir / "X_val.pkl", "rb") as f:
+        X_val = pickle.load(f)
+    with open(data_dir / "y_val.pkl", "rb") as f:
+        y_val = pickle.load(f)
+    with open(data_dir / "X_test.pkl", "rb") as f:
+        X_test = pickle.load(f)
+    with open(data_dir / "y_test.pkl", "rb") as f:
+        y_test = pickle.load(f)
+
+    data = (jnp.asarray(X_train), jnp.asarray(X_val), jnp.asarray(X_test))
+    labels = (jnp.asarray(y_train), jnp.asarray(y_val), jnp.asarray(y_test))
+    return data, labels, lambda x: x
+
+
+
+
+
+
+
 # =============================================
 # SECTION: Entrypoint function
 # =============================================
@@ -823,6 +1290,114 @@ def create_dataset(
         data, labels, data_out_func = load_Adding2000_dataset()
     elif name == "Adding5000":
         data, labels, data_out_func = load_Adding5000_dataset()
+    
+    elif name == "SelectiveCopy":
+        data, labels, data_out_func = load_SelectiveCopy_dataset(
+            L=100,
+            M=10,
+            A=8,
+            n_distractors=0,
+            hard_negatives=False,
+            variable_length=False,
+        )
+
+    elif name == "SelectiveCopyLong":
+        data, labels, data_out_func = load_SelectiveCopy_dataset(
+            L=250,
+            M=16,
+            A=16,
+            n_distractors=0,
+            hard_negatives=False,
+            variable_length=False,
+        )
+
+    elif name == "SelectiveCopyDistractors":
+        data, labels, data_out_func = load_SelectiveCopy_dataset(
+            L=250,
+            M=12,
+            A=10,
+            n_distractors=16,
+            hard_negatives=False,
+            variable_length=False,
+            distractor_near_end=True,
+        )
+
+    elif name == "SelectiveCopyHard":
+        data, labels, data_out_func = load_SelectiveCopy_dataset(
+            L=250,
+            M=16,
+            A=16,
+            n_distractors=32,
+            hard_negatives=True,
+            variable_length=False,
+            distractor_near_end=True,
+        )
+
+    elif name == "SelectiveCopyVariable":
+        data, labels, data_out_func = load_SelectiveCopy_dataset(
+            L=250,
+            M=16,
+            A=16,
+            n_distractors=32,
+            hard_negatives=True,
+            variable_length=True,
+            min_M=4,
+            distractor_near_end=True,
+        )
+
+
+    elif name == "MQAR":
+        data, labels, data_out_func = load_MQAR_dataset(
+            seq_len=256,
+            n_vocab=32,
+            n_pairs=8,
+        )
+    elif name == "MQARLong":
+        data, labels, data_out_func = load_MQAR_dataset(
+            seq_len=512,
+            n_vocab=32,
+            n_pairs=8,
+        )
+    elif name == "MQARHard":
+        data, labels, data_out_func = load_MQAR_dataset(
+            seq_len=512,
+            n_vocab=48,
+            n_pairs=12,
+        )
+
+    elif name == "InductionHeadShort":
+        data, labels, data_out_func = load_InductionHead_dataset(seq_len=200, n_vocab=10, prefix_len=8)
+    elif name == "InductionHead":
+        data, labels, data_out_func = load_InductionHead_dataset(seq_len=256, n_vocab=16, prefix_len=10)
+    elif name == "InductionHeadLong":
+        data, labels, data_out_func = load_InductionHead_dataset(seq_len=350, n_vocab=14, prefix_len=10)
+
+
+
+    elif name == "SyntheticRegressionSwitch":
+        data_dir = BASE_DIR / "data" / "processed" / "synthetic_regression_switch"
+        data, labels, data_out_func = load_presplit_pickle_dataset(data_dir)
+
+        
+    elif name == "WriteHoldReset":
+        data_dir = BASE_DIR / "data" / "processed" / "write_hold_reset"
+        data, labels, data_out_func = load_presplit_pickle_dataset(data_dir)
+
+    elif name == "SyntheticRegressionTV":
+        data_dir = BASE_DIR / "data" / "processed" / "synthetic_regression_tv"
+        data, labels, data_out_func = load_presplit_pickle_dataset(data_dir)
+
+
+
+    elif name == "WriteHoldEraseQuery":
+        data_dir = BASE_DIR / "data" / "processed" / "write_hold_erase_query"
+        data, labels, data_out_func = load_presplit_pickle_dataset(data_dir)
+
+    elif name == "ModeSwitchOscillator":
+        data_dir = BASE_DIR / "data" / "processed" / "mode_switch_oscillator"
+        data, labels, data_out_func = load_presplit_pickle_dataset(data_dir)
+
+
     else:
         raise ValueError(f"Unknown dataset: {name}")
 

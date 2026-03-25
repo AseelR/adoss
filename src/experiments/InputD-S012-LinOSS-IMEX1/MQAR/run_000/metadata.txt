@@ -1,0 +1,3 @@
+Experiment conducted at 2026-03-25 10:22:28 
+# of Parameters: 240,034 
+Memory: 0.92 MiB

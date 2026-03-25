@@ -110,8 +110,6 @@ def create_model(
             G_max=safe_load(hyperparameters, "G_max", float),
             dt_std=safe_load(hyperparameters, "dt_std", float),
             drop_rate=safe_load(hyperparameters, "drop_rate", float),
-            gate_variant=hyperparameters.get("gate_variant", "simple"),
-            
             damping_mode=hyperparameters.get("damping_mode", "constant"),
             gate_type=hyperparameters.get("gate_type", "linear"),
             mult_min=float(hyperparameters.get("mult_min", 0.25)),
@@ -119,9 +117,13 @@ def create_model(
             freq_aware_damping=bool(hyperparameters.get("freq_aware_damping", False)),
             zeta_min=float(hyperparameters.get("zeta_min", 0.0)),
             zeta_max=float(hyperparameters.get("zeta_max", 4.0)),
+            gate_hidden_dim=hyperparameters.get("gate_hidden_dim", 64),
+            gate_nonlinearity=hyperparameters.get("gate_nonlinearity", "gelu"),
+            gate_use_energy=bool(hyperparameters.get("gate_use_energy", False)),
             use_block_deer=bool(hyperparameters.get("use_block_deer", False)),
             deer_num_iters=int(hyperparameters.get("deer_num_iters", 4)),
             deer_damping=float(hyperparameters.get("deer_damping", 0.0)),
+            task_type=hyperparameters.get("task_type", "sequence"),
             key=key,
         )
         state = eqx.nn.State(model)

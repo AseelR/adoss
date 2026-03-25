@@ -195,13 +195,80 @@ def calc_output(model, X, state, key, stateful, nondeterministic):
     return output, state
 
 
+def _align_classification_tensors(pred_y, y):
+    """
+    Supports both:
+      - standard classification: pred_y (B, C), y (B, C)
+      - sequence classification: pred_y (B, T, C), y (B, M, C)
+
+    For sequence classification, compare only the last M predicted steps.
+    Returns flattened tensors:
+      pred_flat: (N, C)
+      y_flat:    (N, C)
+    """
+    if pred_y.ndim == 2 and y.ndim == 2:
+        return pred_y, y
+
+    if pred_y.ndim == 3 and y.ndim == 3:
+        target_len = y.shape[1]
+        pred_y = pred_y[:, -target_len:, :]
+        pred_flat = pred_y.reshape(-1, pred_y.shape[-1])
+        y_flat = y.reshape(-1, y.shape[-1])
+        return pred_flat, y_flat
+
+    raise ValueError(
+        f"Unsupported classification shapes: pred_y {pred_y.shape}, y {y.shape}"
+    )
+
 @eqx.filter_jit
 @eqx.filter_value_and_grad(has_aux=True)
 def classification_loss(model, X, y, state, key):
     pred_y, state = calc_output(model, X, state, key, model.stateful, model.nondeterministic)
-    return jnp.mean(-jnp.sum(y * jnp.log(pred_y + 1e-8), axis=1)), state
+    pred_flat, y_flat = _align_classification_tensors(pred_y, y)
+    loss = -jnp.sum(y_flat * jnp.log(pred_flat + 1e-8), axis=-1)
+    return jnp.mean(loss), state
 
 
+
+
+
+
+def _align_regression_tensors(pred_y, y):
+    """
+    Supports:
+      - sequence -> sequence regression
+      - sequence -> scalar regression
+      - scalar -> scalar regression
+
+    Returns aligned tensors with matching shapes.
+    """
+    pred = jnp.squeeze(pred_y)
+    target = jnp.squeeze(y)
+
+    # seq -> seq
+    if pred.ndim == 2 and target.ndim == 2:
+        return pred, target
+
+    # seq -> scalar
+    if pred.ndim == 2 and target.ndim == 1:
+        return pred[:, -1], target
+
+    # scalar -> seq length-1
+    if pred.ndim == 1 and target.ndim == 2 and target.shape[1] == 1:
+        return pred, target[:, 0]
+
+    # scalar -> scalar
+    if pred.ndim == 1 and target.ndim == 1:
+        return pred, target
+
+    raise ValueError(
+        f"Unsupported regression shapes: pred_y {pred_y.shape}, y {y.shape}"
+    )
+
+
+
+
+    
 @eqx.filter_jit
 @eqx.filter_value_and_grad(has_aux=True)
 def regression_loss(model, X, y, state, key):
@@ -209,14 +276,10 @@ def regression_loss(model, X, y, state, key):
 
     ## changed here for seq -> scalar 
     # pred_y: (batch, seq_len, 1) → take last timestep → (batch, 1) → squeeze to (batch,)
-    pred = jnp.squeeze(pred_y[:, -1, :], axis=-1)
-
-    # y: (batch, 1, 1) → squeeze to (batch,)
-    target = jnp.squeeze(y)
+    pred, target = _align_regression_tensors(pred_y, y)
 
     return jnp.mean((pred - target) ** 2.0), state
 
-    # return jnp.mean((jnp.squeeze(pred_y) - jnp.squeeze(y)) ** 2.0), state
 
 
 @eqx.filter_jit
@@ -247,14 +310,39 @@ def evaluate(inference_model, state, dataloader_iter, key):
     prediction = jnp.vstack(predictions)
     y = jnp.vstack(labels)
 
+    # if inference_model.classification:
+    #     pred_flat, y_flat = _align_classification_tensors(prediction, y)
+    #     metric = jnp.mean(jnp.argmax(pred_flat, axis=-1) == jnp.argmax(y_flat, axis=-1))
+
     if inference_model.classification:
-        metric = jnp.mean(jnp.argmax(prediction, axis=1) == jnp.argmax(y, axis=1))
+        if prediction.ndim == 2 and y.ndim == 2:
+            # standard classification
+            metric = jnp.mean(
+                jnp.argmax(prediction, axis=-1) == jnp.argmax(y, axis=-1)
+            )
+
+        elif prediction.ndim == 3 and y.ndim == 3:
+            target_len = y.shape[1]
+            pred_seq = prediction[:, -target_len:, :]          # (B, M, C)
+            pred_tokens = jnp.argmax(pred_seq, axis=-1)        # (B, M)
+            true_tokens = jnp.argmax(y, axis=-1)               # (B, M)
+
+            # --- OPTION 1: TOKEN ACCURACY ---
+            metric = jnp.mean(pred_tokens == true_tokens)
+
+            # --- OPTION 2: SEQUENCE ACCURACY ---
+            # metric = jnp.mean(jnp.all(pred_tokens == true_tokens, axis=1))
+
+        else:
+            raise ValueError(
+                f"Unsupported classification shapes: prediction {prediction.shape}, y {y.shape}"
+            )
+        
     else:
-        ## changed 
-        pred = jnp.squeeze(prediction[:, -1, :], axis=-1)   # (batch,)
-        target = jnp.squeeze(y)                             # (batch,)
+        pred, target = _align_regression_tensors(prediction, y)
         metric = jnp.mean((pred - target) ** 2.0)
-        # metric = jnp.mean((jnp.squeeze(prediction) - jnp.squeeze(y)) ** 2.0)
+        # or RMSE:
+        # metric = jnp.sqrt(jnp.mean((pred - target) ** 2.0))
     
     return metric
 
@@ -273,7 +361,7 @@ def train_model(
     weight_decay: float,
     cosine_annealing: bool,
     key: jax.Array,
-):
+    ):
     # Initialize model optimizer
     batchkey, key = jr.split(key, 2)
     opt, opt_state = create_optimizer(model, num_steps, lr, ssm_lr_factor, weight_decay, cosine_annealing)
@@ -326,7 +414,7 @@ def train_model(
             val_metric = evaluate(inference_model, state, val_iter, val_key)
             print(
                 f"Step: {step + 1}, "
-                f"Loss: {running_loss / print_steps}, "
+                f"Loss or Acc: {running_loss / print_steps}, "
                 f"Validation metric: {val_metric}, "
                 f"Time: {total_time}"
             )
@@ -343,7 +431,7 @@ def train_model(
                 best_state = copy_tree(state, state_filename)
             else:
                 counter += 1
-                if counter >= 20:
+                if counter >= 20000:
                     print("--- Early Stopping. ---")
                     break
 
@@ -374,7 +462,7 @@ def train_model(
 def create_dataset_model_and_train(
     run_folder: str,
     hyperparameters: dict,
-):
+    ):
     seed = safe_load(hyperparameters, "seed", int)
     model_name = safe_load(hyperparameters, "model_name", str)
     dataset_name = safe_load(hyperparameters, "dataset_name", str)
