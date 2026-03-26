@@ -28,8 +28,8 @@ from typing import Optional
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(BASE_DIR))
 
-from linoss.models.create_model import create_model
-from linoss.data.create_dataset import create_dataset
+from damped_linoss.models.create_model import create_model
+from damped_linoss.data.create_dataset import create_dataset
 
 
 def load_pickle(filename):

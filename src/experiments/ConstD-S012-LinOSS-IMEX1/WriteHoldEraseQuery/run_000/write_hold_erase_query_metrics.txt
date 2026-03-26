@@ -1,0 +1,8 @@
+overall_mse: 0.005179016385227442
+query_mse: 0.5833775997161865
+nonquery_mse: 0.00016729698108974844
+long_gap_query_mse_ge_50: 0.6778731942176819
+post_erase_query_mse_le_10: None
+num_query_points: 2578
+num_long_gap_queries_ge_50: 1850
+num_post_erase_queries_le_10: 0
