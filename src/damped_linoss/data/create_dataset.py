@@ -376,7 +376,7 @@ def load_NoisyCifar10_dataset():
     data = (train_data, val_data, test_data)
     labels = (train_labels, val_labels, test_labels)
 
-    def data_out_func(self, batch):
+    def data_out_func(batch):
         """Noisify during runtime"""
         key = jax.random.PRNGKey(42)
         noise = jax.random.normal(key, shape=(batch.shape[0], 968, batch.shape[-1]))
@@ -784,6 +784,49 @@ def load_Adding5000_dataset():
 
     return data, labels, lambda x: x
 
+
+
+def load_Adding8000_dataset():
+    sql_train = 8000
+    sql_val = 8000
+    sql_test = 8000
+    size_train = 7000
+    size_val = 1500
+    size_test = 1500
+
+    train_key = jax.random.PRNGKey(0)
+    val_key = jax.random.PRNGKey(1)
+    test_key = jax.random.PRNGKey(2)
+
+    def generate_batch(bsz, sql, key):
+        """
+        data: (bsz, sql, 2)
+        labels: (bsz, 1, 1)
+        """
+        key1, key2, key3 = jr.split(key, 3)
+        values = jr.uniform(key1, shape=(bsz, sql, 1))
+        half = sql // 2
+        half_1 = jr.randint(key2, (bsz,), 0, half)
+        half_2 = jr.randint(key3, (bsz,), half, sql)
+        def set_indices(idx1, idx2):
+            arr = jnp.zeros((sql,))
+            arr = arr.at[idx1].set(1)
+            arr = arr.at[idx2].set(1)
+            return arr
+        indices_1d = jax.vmap(set_indices)(half_1, half_2)
+        indices = jnp.expand_dims(indices_1d, axis=-1)  # shape: (bsz, sql, 1)
+        data = jnp.concatenate((values, indices), axis=2)
+        labels = (values * indices).sum(axis=1, keepdims=True)
+        return data, labels
+
+    train_data, train_labels = generate_batch(size_train, sql_train, train_key)
+    val_data, val_labels = generate_batch(size_val, sql_val, val_key)
+    test_data, test_labels = generate_batch(size_test, sql_test, test_key)
+
+    data = (train_data, val_data, test_data)
+    labels = (train_labels, val_labels, test_labels)
+
+    return data, labels, lambda x: x
 
 
 
@@ -1264,6 +1307,7 @@ def create_dataset(
     in_memory=False,
     key=None,
 ):
+    data_dir = str(BASE_DIR / "data")
     if name in get_subfolders(os.path.join(data_dir, "processed", "UEA")):
         data, labels, data_out_func = load_UEA_dataset(name, data_dir)
     elif name in get_subfolders(os.path.join(data_dir, "processed", "SE3")):
@@ -1290,6 +1334,9 @@ def create_dataset(
         data, labels, data_out_func = load_Adding2000_dataset()
     elif name == "Adding5000":
         data, labels, data_out_func = load_Adding5000_dataset()
+
+    elif name == "Adding8000":
+        data, labels, data_out_func = load_Adding8000_dataset()
     
     elif name == "SelectiveCopy":
         data, labels, data_out_func = load_SelectiveCopy_dataset(

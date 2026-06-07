@@ -16,11 +16,11 @@ import numpy as np
 
 def create_grid_experiment(experiment_folder, model_name, dataset_name):
     # Hyperparameter sweep
-    seed = [1, 0, 2] # [3, 4, 5] 
+    seed = [0, 1, 9] # [2345,3456,4567,5678,6789] # [3, 4, 5] # [1, 0, 2] # 1, 15, 5, 107, 
     damping_mode = ["input"]
 
-    lr = [1e-4]
-    state_dim = [128]
+    lr = [1e-3]
+    state_dim = [64]
     hidden_dim = [128]
     num_blocks = [2] # [2, 4, 6]
     include_time = [False]
@@ -33,11 +33,11 @@ def create_grid_experiment(experiment_folder, model_name, dataset_name):
             "model_name": model_name,
             "dataset_name": dataset_name,
             "data_dir": "data",
-            "classification": False,
+            "classification": True,
             "use_presplit": True,
             "output_step": 1,
-            "num_steps": 300000,
-            "print_steps": 100,
+            "num_steps": 5000,
+            "print_steps": 50,
             "batch_size": 32,
             "lr": _learning_rate,
             "ssm_lr_factor": 1.0,  # _ssm_lr_factor,
@@ -50,11 +50,11 @@ def create_grid_experiment(experiment_folder, model_name, dataset_name):
             "layer_name": "DampedIMEX1",
             "damping_mode": _damping_mode,   # or "constant" for baseline
             "gate_type": "linear",
-            "freq_aware_damping": True, # set to False for ordinary input dependent damping 
+            "freq_aware_damping": False, # set to False for ordinary input dependent damping 
             "zeta_min": 0.0,
             "zeta_max": 4.0,
             "mult_min": 0.1,
-            "mult_max": 6.0,
+            "mult_max": 4.0,
 
             "gate_hidden_dim": 64,
             "gate_nonlinearity": "gelu",
@@ -84,7 +84,36 @@ def create_grid_experiment(experiment_folder, model_name, dataset_name):
 
             # change based on task being adding, induction or copy
             "task_type": "sequence", #sequence for adding task, induction for induction head, token for sel. copy 
+            
+            # "classification": True,
+            # "use_presplit": True,
+            # "output_step": 1,
+            # "num_steps": 50000,
+            # "print_steps": 500,
+            # "batch_size": 32,
+            # "lr": 1e-3,
+            # "ssm_lr_factor": 1.0,
+            # "weight_decay": 0.0,
+            # "cosine_annealing": True,
+            # "include_time": False,
+            # "time_duration": 1.0,
+            # "tanh_output": False,
 
+            # "state_dim": 128,
+            # "hidden_dim": 128,
+            # "num_blocks": 2,
+            # "drop_rate": 0.1,
+
+            # "ssm_blocks": 1,
+            # "C_init": "lecun_normal",
+            # "conj_sym": True,
+            # "clip_eigs": False,
+            # "discretization": "zoh",
+            # "dt_min": 0.001,
+            # "dt_max": 0.1,
+            # "step_rescale": 1.0,
+
+            # "seed": 3,
 
         }
 
@@ -186,12 +215,11 @@ def create_random_experiment(experiment_folder, model_name, dataset_name):
 
 if __name__ == "__main__":
     model_name = "LinOSS"
-    dataset_name = "ModeSwitchOscillator"
-    experiment_folder = f"experiments/InputD-lin-freq-S012-LinOSS-IMEX1/{dataset_name}/"
+    dataset_name = "EigenWorms"
+    experiment_folder = f"experiments/final-InputD-S0-LinOSS-IMEX1/{dataset_name}/"
 
     if os.path.exists(experiment_folder):
         raise RuntimeError("Experiment already exists!")
 
     create_grid_experiment(experiment_folder, model_name, dataset_name)
-    # create_random_experiment(experiment_folder, model_name, dataset_name)
-                                                                           
+    # create_random_experiment(experiment_foxlder, model_name, dataset_name)

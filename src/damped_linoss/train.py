@@ -423,6 +423,15 @@ def train_model(
             step_times.append(total_time)
             running_loss = 0.0
 
+            # save partial log so interrupted runs still have trajectories
+            log_data = jnp.stack([
+                jnp.arange(print_steps, (len(val_metrics) + 1) * print_steps, print_steps),
+                jnp.array(step_times),
+                jnp.array(running_losses),
+                jnp.array(val_metrics),
+            ], axis=1)
+            jnp.save(os.path.join(run_folder, "log_metrics.npy"), log_data)
+
             # Improvement checking / early stopping
             if improvement(val_metric, best_val_metric):
                 counter = 0

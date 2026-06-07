@@ -234,6 +234,7 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
     gate_in: eqx.nn.Linear | None
     gate_out: eqx.nn.Linear | None
     gate_energy_scale: jax.Array | None
+    gate_input_norm: eqx.nn.LayerNorm | None
 
     # local per-mode state gate params
     state_w_z_re: jax.Array | None
@@ -249,6 +250,8 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
     state_input_w_x_re: jax.Array | None
     state_input_w_x_im: jax.Array | None
     state_input_bias: jax.Array | None
+
+    
 
     def __init__(
         self,
@@ -337,17 +340,50 @@ class DampedIMEX1Layer(_AbstractLinOSSLayer):
         self.gate_in = None
         self.gate_out = None
         self.gate_energy_scale = None
+        self.gate_input_norm = eqx.nn.LayerNorm(hidden_dim)
         
         if damping_mode == "input":
             if gate_type == "linear":
                 self.gate_linear = eqx.nn.Linear(hidden_dim, state_dim, key=gate_key)
                 self.gate_in = None
                 self.gate_out = None
+            # if gate_type == "linear":
+            #     self.gate_linear = eqx.nn.Linear(hidden_dim, state_dim, key=gate_key)
+            #     self.gate_linear = eqx.tree_at(
+            #         lambda m: m.weight,
+            #         self.gate_linear,
+            #         0.01 * self.gate_linear.weight,
+            #     )
+            #     self.gate_linear = eqx.tree_at(
+            #         lambda m: m.bias,
+            #         self.gate_linear,
+            #         jnp.zeros_like(self.gate_linear.bias),
+            #     )
+            #     self.gate_in = None
+            #     self.gate_out = None
+
             elif gate_type == "mlp":
                 gate_key1, gate_key2 = jr.split(gate_key, 2)
                 self.gate_linear = None
                 self.gate_in = eqx.nn.Linear(hidden_dim, gate_hidden_dim, key=gate_key1)
                 self.gate_out = eqx.nn.Linear(gate_hidden_dim, state_dim, key=gate_key2)
+            
+            # elif gate_type == "mlp":
+            #     gate_key1, gate_key2 = jr.split(gate_key, 2)
+            #     self.gate_linear = None
+            #     self.gate_in = eqx.nn.Linear(hidden_dim, gate_hidden_dim, key=gate_key1)
+            #     self.gate_out = eqx.nn.Linear(gate_hidden_dim, state_dim, key=gate_key2)
+
+            #     self.gate_out = eqx.tree_at(
+            #         lambda m: m.weight,
+            #         self.gate_out,
+            #         0.01 * self.gate_out.weight,
+            #     )
+            #     self.gate_out = eqx.tree_at(
+            #         lambda m: m.bias,
+            #         self.gate_out,
+            #         jnp.zeros_like(self.gate_out.bias),
+            #     )
             else:
                 raise NotImplementedError(f"gate_type={gate_type} not implemented.")
 

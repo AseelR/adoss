@@ -499,7 +499,7 @@ class S5(eqx.Module):
         ]
         self.linear_decoder = eqx.nn.Linear(hidden_dim, output_dim, key=linear_decoder_key)
         self.classification = classification
-        self.linear_output = tanh_output
+        self.tanh_output = tanh_output
         self.output_step = output_step
 
     def __call__(self, x, state, key):

@@ -1,6 +1,9 @@
-/analysis/
-/data/
-/experiments/
-/submit_batch.sbatch
-/submit_batch.sh
-__pycache__/
+# Ignore everything inside the experiments folder
+src/experiments/
+
+# Ignore any __pycache__ folder anywhere in the project
+**/__pycache__/
+
+# Ignore specific data folders
+src/damped_linoss/data/processed/UEA/
+src/data/raw/
